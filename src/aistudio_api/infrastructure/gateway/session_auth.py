@@ -137,6 +137,8 @@ async def _profile_has_live_credentials(page: CDPPage) -> bool:
     which a CDP ``setCookies`` overwrite cannot reproduce. Overwriting it
     downgrades the session and breaks silent renewal.
     """
+    if is_login_page_url(getattr(page, "url", None)):
+        return False
     try:
         cookies = await page.get_cookies()
     except Exception:
@@ -593,7 +595,7 @@ async def navigate_to_aistudio(
                     "访问 AI Studio 后检测到重定向至登录页: %s，尝试重新注入 Cookie...",
                     current_url,
                 )
-                if not await load_cookies_to_page(page, auth_file):
+                if not await load_cookies_to_page(page, auth_file, force_inject=True):
                     raise SessionExpiredError(
                         f"Cookie 认证失败，已被重定向到 Google 登录页。 (url={current_url})"
                     )

@@ -374,3 +374,30 @@ async def test_cleanup_stream_page_writes_rotated_cookies_back(tmp_path):
         await session.cleanup_stream_page(page)
 
     save_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_load_cookies_injects_when_page_on_login_url(tmp_path):
+    auth_file = tmp_path / "auth.json"
+    _write_auth(
+        auth_file, [{"name": "SID", "value": "from_disk", "domain": ".google.com"}]
+    )
+    cdp = _FakeCDP(
+        {
+            "Storage.getCookies": {
+                "cookies": [
+                    {
+                        "name": "SID",
+                        "value": "stale",
+                        "domain": ".google.com",
+                        "expires": int(time.time()) + 3600,
+                    }
+                ]
+            }
+        }
+    )
+    page = _page_with(cdp)
+    page.url = "https://accounts.google.com/v3/signin/identifier"
+
+    assert await load_cookies_to_page(page, str(auth_file)) is True
+    assert len(cdp.calls("Network.setCookies")) == 1
