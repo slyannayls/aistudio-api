@@ -151,7 +151,16 @@ class BrowserSession:
         if self._gate.is_ready() and self._gate.active_context is not None:
             return self._gate.active_context
 
-        if self._gate.state == SessionState.UNINITIALIZED:
+        # 会话门处于 FAILED 时不再永久卡死：重置后重建会话。
+        # 原逻辑只在 UNINITIALIZED 时重建，一旦 set_failed 就永远抛错，
+        # 后续每个请求都在几十毫秒内直接失败，只能重启进程。
+        if self._gate.state in (SessionState.UNINITIALIZED, SessionState.FAILED):
+            if self._gate.state == SessionState.FAILED:
+                log.warning(
+                    "会话门处于 FAILED 状态（%s），重置后重建会话",
+                    getattr(self._gate, "_last_error", None),
+                )
+                self._gate.reset()
             await self.transition_to_account(self._auth_file, force_refresh=False)
 
         return await self._gate.wait_ready(timeout_s=timeout_s)
