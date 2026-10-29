@@ -913,7 +913,7 @@ class CDPClient:
     async def create_new_page(self, block_assets: bool = True) -> CDPPage:
         """Create a dedicated new tab target and connect CDP Page to it."""
         await self.wait_until_ready()
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.put(f"{self.base_url}/json/new")
             resp.raise_for_status()
             page_target = resp.json()
