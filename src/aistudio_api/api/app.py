@@ -133,12 +133,30 @@ async def lifespan(_app: FastAPI):
                         pass
     tier_task = asyncio.create_task(_auto_refresh_tiers())
 
+    keepalive_task = None
+
+    async def _session_keepalive_loop():
+        while True:
+            try:
+                await asyncio.sleep(120)
+                client_instance = runtime_state.client
+                if client_instance and client_instance._session:
+                    await client_instance._session.keepalive_tick()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("后台保活任务异常: %s", e)
+
+    keepalive_task = asyncio.create_task(_session_keepalive_loop())
+
     yield
     logger.info("服务正在关闭")
     if warmup_task and not warmup_task.done():
         warmup_task.cancel()
     if tier_task and not tier_task.done():
         tier_task.cancel()
+    if keepalive_task and not keepalive_task.done():
+        keepalive_task.cancel()
     if client:
         try:
             await client.close()

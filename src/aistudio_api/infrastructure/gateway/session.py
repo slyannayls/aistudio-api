@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from hashlib import sha256
@@ -83,6 +84,7 @@ class BrowserSession:
         self._background_tasks: set[asyncio.Task[object]] = set()
         self._in_flight: int = 0
         self._stream_cleanup_count: int = 0
+        self._last_activity: float = time.time()
 
     @property
     def state(self) -> SessionState:
@@ -136,6 +138,7 @@ class BrowserSession:
     async def request_scope(self):
         """追踪活动请求。"""
         self._in_flight += 1
+        self._last_activity = time.time()
         ctx = self.active_context
         if ctx is not None:
             ctx.in_flight += 1
@@ -143,6 +146,7 @@ class BrowserSession:
             yield ctx
         finally:
             self._in_flight = max(0, self._in_flight - 1)
+            self._last_activity = time.time()
             if ctx is not None:
                 ctx.decr_in_flight()
 
@@ -227,6 +231,7 @@ class BrowserSession:
                     new_page,
                     auth_file,
                     switching_account=old_context is not None,
+                    previous_auth=old_context.auth_file if old_context else None,
                 )
                 await navigate_to_aistudio(
                     new_page,
@@ -509,6 +514,38 @@ class BrowserSession:
         return bool(
             target and await load_cookies_to_page(target, self._auth_file, force_inject=True)
         )
+
+    async def keepalive_tick(self) -> bool:
+        """Perform a periodic lightweight keep-alive if the session has been idle."""
+        if self._in_flight > 0:
+            return False
+        if not self._gate.is_ready():
+            return False
+        page = self.page
+        if page is None or page.is_closed():
+            return False
+
+        now = time.time()
+        # Only perform keep-alive if idle for >= 15 minutes (900 seconds)
+        if now - self._last_activity < 900:
+            return False
+
+        try:
+            auth_user = self.get_current_auth_user()
+            log.info(
+                "[keepalive] 会话已空闲 %.1f 分钟，执行轻量保活心跳 (u/%s)...",
+                (now - self._last_activity) / 60,
+                auth_user,
+            )
+            await extract_account_tier(page, auth_user=auth_user)
+            if self._auth_file:
+                await save_browser_cookies(page, self._auth_file)
+            self._last_activity = time.time()
+            log.info("[keepalive] 保活心跳完成，已同步刷新凭据")
+            return True
+        except Exception as e:
+            log.warning("[keepalive] 保活心跳执行失败: %s", e)
+            return False
 
     async def _save_cookies(
         self,

@@ -220,10 +220,18 @@ async def bootstrap_botguard_and_template(
                     "Google AI Studio 地区限制: 访问被重定向至 available-regions"
                 ) from err
 
-            dbg_title = await page.title()
-            raise RuntimeError(
-                f"textarea not found while capturing BotGuardService; url={dbg_url}, title={dbg_title}"
-            ) from err
+            # If textarea was blocked by a welcome or terms onboarding modal, retry cleanup
+            with suppress(Exception):
+                await page.evaluate(DIALOG_CLEANUP_JS)
+                await page.wait_for_timeout(600)
+                await page.wait_for_selector("textarea", timeout_s=5.0)
+                err = None
+
+            if err is not None:
+                dbg_title = await page.title()
+                raise RuntimeError(
+                    f"textarea not found while capturing BotGuardService; url={dbg_url}, title={dbg_title}"
+                ) from err
 
         original_text = str(
             (

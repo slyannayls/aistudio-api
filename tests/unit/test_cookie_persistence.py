@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -363,7 +364,7 @@ async def test_cleanup_stream_page_writes_rotated_cookies_back(tmp_path):
 
     page = MagicMock(spec=CDPPage)
     page.is_closed = MagicMock(return_value=False)
-    page.url = "https://aistudio.google.com/prompts/new_chat"
+    page._last_url = "https://aistudio.google.com/prompts/new_chat"
     page.evaluate = AsyncMock()
     page.collect_garbage = AsyncMock()
 
@@ -397,7 +398,213 @@ async def test_load_cookies_injects_when_page_on_login_url(tmp_path):
         }
     )
     page = _page_with(cdp)
-    page.url = "https://accounts.google.com/v3/signin/identifier"
+    page._last_url = "https://accounts.google.com/v3/signin/identifier"
 
     assert await load_cookies_to_page(page, str(auth_file)) is True
     assert len(cdp.calls("Network.setCookies")) == 1
+
+
+@pytest.mark.asyncio
+async def test_save_browser_cookies_syncs_to_sibling_accounts(tmp_path):
+    accounts_dir = tmp_path / "accounts"
+    accounts_dir.mkdir()
+
+    # acc_1 (target)
+    acc1_dir = accounts_dir / "acc_1"
+    acc1_dir.mkdir()
+    (acc1_dir / "meta.json").write_text(json.dumps({"id": "acc_1", "cookie_id": "group_shared"}))
+    acc1_auth = acc1_dir / "auth.json"
+    _write_auth(acc1_auth, [{"name": "SID", "value": "old_sid", "domain": ".google.com"}])
+
+    # acc_2 (sibling with same cookie_id)
+    acc2_dir = accounts_dir / "acc_2"
+    acc2_dir.mkdir()
+    (acc2_dir / "meta.json").write_text(json.dumps({"id": "acc_2", "cookie_id": "group_shared"}))
+    acc2_auth = acc2_dir / "auth.json"
+    _write_auth(acc2_auth, [{"name": "SID", "value": "old_sid", "domain": ".google.com"}])
+
+    # acc_3 (different cookie_id)
+    acc3_dir = accounts_dir / "acc_3"
+    acc3_dir.mkdir()
+    (acc3_dir / "meta.json").write_text(json.dumps({"id": "acc_3", "cookie_id": "group_different"}))
+    acc3_auth = acc3_dir / "auth.json"
+    _write_auth(acc3_auth, [{"name": "SID", "value": "diff_sid", "domain": ".google.com"}])
+
+    cdp = _FakeCDP(
+        {
+            "Storage.getCookies": {
+                "cookies": [
+                    {
+                        "name": "SID",
+                        "value": "rolled_sid",
+                        "domain": ".google.com",
+                        "expires": int(time.time()) + 3600,
+                    },
+                    {
+                        "name": "__Secure-1PSIDTS",
+                        "value": "ts_fresh_123",
+                        "domain": ".google.com",
+                        "expires": int(time.time()) + 3600,
+                    },
+                ]
+            }
+        }
+    )
+    page = _page_with(cdp)
+
+    await save_browser_cookies(page, str(acc1_auth))
+
+    # Verify acc_1 was updated
+    data1 = json.loads(acc1_auth.read_text())
+    names1 = {c["name"]: c["value"] for c in data1["cookies"]}
+    assert names1["SID"] == "rolled_sid"
+    assert names1["__Secure-1PSIDTS"] == "ts_fresh_123"
+
+    # Verify acc_2 (sibling) was also updated with fresh rolled tokens
+    data2 = json.loads(acc2_auth.read_text())
+    names2 = {c["name"]: c["value"] for c in data2["cookies"]}
+    assert names2["SID"] == "rolled_sid"
+    assert names2["__Secure-1PSIDTS"] == "ts_fresh_123"
+
+    # Verify acc_3 (different group) was untouched
+    data3 = json.loads(acc3_auth.read_text())
+    names3 = {c["name"]: c["value"] for c in data3["cookies"]}
+    assert names3["SID"] == "diff_sid"
+    assert "__Secure-1PSIDTS" not in names3
+
+
+@pytest.mark.asyncio
+async def test_load_cookies_skips_clear_for_same_cookie_group(tmp_path):
+    accounts_dir = tmp_path / "accounts"
+    accounts_dir.mkdir()
+
+    acc1_dir = accounts_dir / "acc_1"
+    acc1_dir.mkdir()
+    (acc1_dir / "meta.json").write_text(json.dumps({"id": "acc_1", "cookie_id": "group_shared"}))
+    acc1_auth = acc1_dir / "auth.json"
+    _write_auth(acc1_auth, [{"name": "SID", "value": "sid_val", "domain": ".google.com"}])
+
+    acc2_dir = accounts_dir / "acc_2"
+    acc2_dir.mkdir()
+    (acc2_dir / "meta.json").write_text(json.dumps({"id": "acc_2", "cookie_id": "group_shared"}))
+    acc2_auth = acc2_dir / "auth.json"
+    _write_auth(acc2_auth, [{"name": "SID", "value": "sid_val", "domain": ".google.com"}])
+
+    cdp = _FakeCDP(
+        {
+            "Storage.getCookies": {
+                "cookies": [
+                    {
+                        "name": "SID",
+                        "value": "sid_val",
+                        "domain": ".google.com",
+                        "expires": int(time.time()) + 3600,
+                    }
+                ]
+            }
+        }
+    )
+    page = _page_with(cdp)
+
+    # Initial load for acc_1
+    await load_cookies_to_page(page, str(acc1_auth))
+
+    # Switching from acc_1 to acc_2 (same cookie_id)
+    await load_cookies_to_page(
+        page,
+        str(acc2_auth),
+        switching_account=True,
+        previous_auth=str(acc1_auth),
+    )
+
+    # Should NOT have sent clearBrowserCookies
+    assert len(cdp.calls("Network.clearBrowserCookies")) == 0
+
+
+@pytest.mark.asyncio
+async def test_load_cookies_clears_for_different_cookie_group(tmp_path):
+    accounts_dir = tmp_path / "accounts"
+    accounts_dir.mkdir()
+
+    acc1_dir = accounts_dir / "acc_1"
+    acc1_dir.mkdir()
+    (acc1_dir / "meta.json").write_text(json.dumps({"id": "acc_1", "cookie_id": "group_A"}))
+    acc1_auth = acc1_dir / "auth.json"
+    _write_auth(acc1_auth, [{"name": "SID", "value": "sid_A", "domain": ".google.com"}])
+
+    acc2_dir = accounts_dir / "acc_2"
+    acc2_dir.mkdir()
+    (acc2_dir / "meta.json").write_text(json.dumps({"id": "acc_2", "cookie_id": "group_B"}))
+    acc2_auth = acc2_dir / "auth.json"
+    _write_auth(acc2_auth, [{"name": "SID", "value": "sid_B", "domain": ".google.com"}])
+
+    cdp = _FakeCDP(
+        {
+            "Storage.getCookies": {
+                "cookies": [
+                    {
+                        "name": "SID",
+                        "value": "sid_A",
+                        "domain": ".google.com",
+                        "expires": int(time.time()) + 3600,
+                    }
+                ]
+            }
+        }
+    )
+    page = _page_with(cdp)
+
+    # Switching from acc_1 to acc_2 (different cookie_id)
+    await load_cookies_to_page(
+        page,
+        str(acc2_auth),
+        switching_account=True,
+        previous_auth=str(acc1_auth),
+    )
+
+    # Must clear browser cookies when switching across different accounts
+    assert len(cdp.calls("Network.clearBrowserCookies")) == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_session_keepalive_tick(tmp_path):
+    session = BrowserSession(port=9222)
+    session._auth_file = str(tmp_path / "auth.json")
+    _write_auth(Path(session._auth_file), [{"name": "SID", "value": "sid", "domain": ".google.com"}])
+
+    # 1. Not ready -> False
+    assert await session.keepalive_tick() is False
+
+    # 2. Ready but active requests in flight -> False
+    cdp = _FakeCDP({"Storage.getCookies": {"cookies": []}})
+    page = _page_with(cdp)
+    from aistudio_api.infrastructure.gateway.session_state import SessionContext
+    ctx = SessionContext(
+        page=page,
+        snap_key="snap",
+        auth_user="0",
+        auth_file=session._auth_file,
+        base_template={},
+        tier="Free",
+    )
+    session.set_ready_context(ctx)
+    session._in_flight = 1
+    assert await session.keepalive_tick() is False
+
+    # 3. Ready, no in-flight, but idle for < 15 min -> False
+    session._in_flight = 0
+    session._last_activity = time.time()
+    assert await session.keepalive_tick() is False
+
+    # 4. Ready, idle >= 15 min (e.g. 1000s) -> triggers keepalive
+    session._last_activity = time.time() - 1000
+    with patch(
+        "aistudio_api.infrastructure.gateway.session.extract_account_tier",
+        AsyncMock(return_value="Free"),
+    ), patch(
+        "aistudio_api.infrastructure.gateway.session.save_browser_cookies",
+        AsyncMock(),
+    ) as save_mock:
+        assert await session.keepalive_tick() is True
+        save_mock.assert_awaited_once()
+        assert time.time() - session._last_activity < 5
