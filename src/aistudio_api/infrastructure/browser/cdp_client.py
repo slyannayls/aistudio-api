@@ -204,7 +204,7 @@ class CDPConnection:
         self,
         method: str,
         params: dict[str, object] | None = None,
-        timeout_s: float = 30.0,
+        timeout_s: float | None = 30.0,
     ) -> dict[str, object]:
         """Send a JSON-RPC command over CDP and await result."""
         if not self.ws or self._closed:
@@ -230,6 +230,8 @@ class CDPConnection:
             raise RuntimeError(f"CDP connection closed: {e}") from e
 
         try:
+            if timeout_s is None or timeout_s <= 0:
+                return await fut
             return await asyncio.wait_for(fut, timeout=timeout_s)
         except Exception:
             self._futures.pop(req_id, None)
@@ -258,6 +260,11 @@ class CDPConnection:
     async def close(self) -> None:
         """Close WebSocket connection cleanly."""
         self._closed = True
+        for task in list(self._background_tasks):
+            if not task.done():
+                task.cancel()
+        self._background_tasks.clear()
+        self._listeners.clear()
         if self._recv_task and not self._recv_task.done():
             self._recv_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -388,7 +395,7 @@ class CDPPage:
         args: object = None,
         await_promise: bool = True,
         return_by_value: bool = True,
-        timeout_s: float = 30.0,
+        timeout_s: float | None = 30.0,
     ) -> object:
         """Evaluate a JS expression or function in the page's main world."""
         expr = expression.strip()
