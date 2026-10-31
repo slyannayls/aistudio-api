@@ -24,6 +24,7 @@ from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
     BOTGUARD_BOOTSTRAP_PROMPT,
     bootstrap_botguard_and_template,
 )
+from aistudio_api.infrastructure.gateway.remote_proof import RemoteProofClient
 from aistudio_api.infrastructure.gateway.session_auth import (
     bootstrap_google_session,
     derive_profile_dir,
@@ -80,6 +81,7 @@ class BrowserSession:
         self._transition_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
         self._transport = XHRStreamTransport()
+        self._remote_proof_client = RemoteProofClient()
         self._retiring_contexts: list[SessionContext] = []
         self._background_tasks: set[asyncio.Task[object]] = set()
         self._in_flight: int = 0
@@ -387,12 +389,39 @@ class BrowserSession:
             log.debug("Failed to adapt model into base template body: %s", e)
         return base
 
-    async def generate_snapshot(
+    def _extract_account_cookies(self, ctx: SessionContext) -> str:
+        from aistudio_api.infrastructure.gateway.remote_proof import _format_cookies
+
+        auth_file = ctx.auth_file or self._auth_file
+        if auth_file and Path(auth_file).is_file():
+            try:
+                data = json.loads(Path(auth_file).read_text(encoding="utf-8"))
+                cookies = data.get("cookies")
+                formatted = _format_cookies(cookies)
+                if formatted:
+                    return formatted
+            except Exception as e:
+                log.debug("Failed to read cookies from auth_file %s: %s", auth_file, e)
+        return ""
+
+    async def _get_cookies_for_remote_proof(self, ctx: SessionContext) -> str:
+        cookies_str = self._extract_account_cookies(ctx)
+        if cookies_str:
+            return cookies_str
+        if ctx.page and not ctx.page.is_closed():
+            try:
+                raw_cookies = await ctx.page.evaluate("() => document.cookie")
+                if raw_cookies and isinstance(raw_cookies, str):
+                    return raw_cookies
+            except Exception:
+                pass
+        return ""
+
+    async def _generate_browser_snapshot(
         self,
         contents: list[AistudioContent],
-        ctx: SessionContext | None = None,
+        ctx: SessionContext,
     ) -> str:
-        active_ctx = ctx or await self.ensure_ready()
         hash_parts: list[str] = []
         for content in contents:
             for part in content.parts:
@@ -409,19 +438,61 @@ class BrowserSession:
         async with self._snapshot_lock:
             for attempt in range(5):
                 try:
-                    snapshot = await active_ctx.page.evaluate(
+                    snapshot = await ctx.page.evaluate(
                         SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=25.0
                     )
                     if snapshot and isinstance(snapshot, str) and len(snapshot) > 0:
                         return snapshot
                 except Exception as e:
-                    log.debug("快照计算第 %d 次尝试失败: %s", attempt + 1, e)
+                    log.debug("浏览器快照计算第 %d 次尝试失败: %s", attempt + 1, e)
                 if attempt < 4:
-                    await active_ctx.page.wait_for_timeout(250)
+                    await ctx.page.wait_for_timeout(250)
 
         raise RuntimeError(
             f"Snapshot generation failed for content hash {content_hash[:8]}"
         )
+
+    async def generate_snapshot(
+        self,
+        contents: list[AistudioContent],
+        ctx: SessionContext | None = None,
+        model: str | None = None,
+    ) -> str:
+        from aistudio_api.infrastructure.gateway.model_defaults import (
+            get_configured_proof_engine_settings,
+        )
+
+        active_ctx = ctx or await self.ensure_ready()
+        engine_cfg = get_configured_proof_engine_settings()
+        provider = str(engine_cfg.get("provider") or "browser").lower()
+        auto_fallback = bool(engine_cfg.get("auto_fallback", True))
+        remote_url = str(engine_cfg.get("remote_url") or "https://waa.spinsnow.fun")
+        timeout = float(engine_cfg.get("timeout_seconds") or 15)
+
+        if provider == "remote":
+            try:
+                cookies = await self._get_cookies_for_remote_proof(active_ctx)
+                if not cookies:
+                    raise RuntimeError("Active session has no valid cookies for remote proof")
+                auth_user = active_ctx.auth_user or "0"
+                return await self._remote_proof_client.mint_proof(
+                    cookies=cookies,
+                    model=model or "models/gemini-3.8-flash",
+                    auth_user=auth_user,
+                    contents=contents,
+                    remote_url=remote_url,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                if auto_fallback:
+                    log.warning(
+                        "⚠️ 远程 WAA 逆向签名失败 (%s)，正在自动降级至本地 Chrome 浏览器生成快照...",
+                        e,
+                    )
+                    return await self._generate_browser_snapshot(contents, active_ctx)
+                raise
+
+        return await self._generate_browser_snapshot(contents, active_ctx)
 
     async def send_hooked_request(
         self,
@@ -626,6 +697,8 @@ class BrowserSession:
         self._gate.reset()
         self._retiring_contexts.clear()
         self._transport.close("session_closed")
+        with suppress(Exception):
+            await self._remote_proof_client.close()
 
         for task in list(self._background_tasks):
             if not task.done():
