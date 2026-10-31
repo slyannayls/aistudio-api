@@ -19,9 +19,9 @@ from aistudio_api.infrastructure.browser.cdp_client import CDPClient, CDPPage
 from aistudio_api.infrastructure.browser.scripts import (
     DOM_GC_CLEANUP_JS,
     SNAPSHOT_GENERATE_JS,
+    build_snapshot_args,
 )
 from aistudio_api.infrastructure.gateway.botguard_bootstrap import (
-    BOTGUARD_BOOTSTRAP_PROMPT,
     bootstrap_botguard_and_template,
 )
 from aistudio_api.infrastructure.gateway.remote_proof import RemoteProofClient
@@ -178,7 +178,7 @@ class BrowserSession:
         if page is not None and not page.is_closed():
             if await page.is_alive(timeout_s=1.0):
                 return page
-            log.warning("浏览器页面无响应，重新连接...")
+            log.warning("当前页面无响应，尝试重新连接")
         await self._close_internal()
         res = await self._ensure_browser_cdp()
         return res or (await self.ensure_ready()).page
@@ -265,6 +265,7 @@ class BrowserSession:
                     is_proc_alive_cb=lambda: (
                         self._proc is None or self._proc.is_alive()
                     ),
+                    auth_user=target_auth_user,
                 )
 
                 new_page._cached_cookies = None
@@ -297,7 +298,7 @@ class BrowserSession:
                     drain_task.add_done_callback(self._background_tasks.discard)
                 self._gate.set_ready(new_context)
                 log.info(
-                    "会话切换完成: auth_file=%s, u/%s (活跃在途=%d)",
+                    "会话切换成功: 文件=%s, auth_user=%s, 在途请求数=%d",
                     auth_file,
                     target_auth_user,
                     self._in_flight,
@@ -320,7 +321,7 @@ class BrowserSession:
                         with suppress(Exception):
                             await self._cdp_client.close_target(new_page.target_id)
                 self._gate.set_failed(exc)
-                log.error("会话切换失败: %s", exc)
+                log.error("会话切换失败: 目标文件=%s, 错误=%s", auth_file, exc)
                 raise
 
     async def _drain_retiring_context(
@@ -332,9 +333,7 @@ class BrowserSession:
             if context.page.is_closed():
                 break
             with suppress(TimeoutError):
-                await asyncio.wait_for(context.drain_event.wait(), timeout=2.0)
-                break
-
+                await asyncio.wait_for(context.drain_event.wait(), timeout=5.0)
         with suppress(Exception):
             if context in self._retiring_contexts:
                 self._retiring_contexts.remove(context)
@@ -386,7 +385,7 @@ class BrowserSession:
                     body_list[0] = normalized_model
                     base["body"] = json.dumps(body_list, separators=(",", ":"))
         except Exception as e:
-            log.debug("Failed to adapt model into base template body: %s", e)
+            log.debug("适配模型名称至模板失败: %s", e)
         return base
 
     def _extract_account_cookies(self, ctx: SessionContext) -> str:
@@ -433,20 +432,28 @@ class BrowserSession:
                     hash_parts.append(str(part.file_id))
                 else:
                     hash_parts.append("")
-        content_hash = sha256(" ".join(hash_parts).encode("utf-8")).hexdigest()
-
+        prompt = " ".join(hash_parts)
+        content_hash = sha256(prompt.encode("utf-8")).hexdigest()
+        log.debug("开始计算内容快照: hash=%s, prompt_len=%d", content_hash[:8], len(prompt))
         async with self._snapshot_lock:
-            for attempt in range(5):
+            args = build_snapshot_args(prompt=prompt, content_hash=content_hash)
+            for attempt in range(3):
                 try:
-                    snapshot = await ctx.page.evaluate(
-                        SNAPSHOT_GENERATE_JS, args=content_hash, timeout_s=25.0
+                    raw_res = await ctx.page.evaluate(
+                        SNAPSHOT_GENERATE_JS, args=args, timeout_s=15.0
                     )
-                    if snapshot and isinstance(snapshot, str) and len(snapshot) > 0:
+                    snapshot = ""
+                    if isinstance(raw_res, dict):
+                        snapshot = str(raw_res.get("snapshot") or "")
+                    elif isinstance(raw_res, str):
+                        snapshot = raw_res
+                    if snapshot:
+                        log.debug("内容快照计算完成: hash=%s, 长度=%d", content_hash[:8], len(snapshot))
                         return snapshot
                 except Exception as e:
                     log.debug("浏览器快照计算第 %d 次尝试失败: %s", attempt + 1, e)
-                if attempt < 4:
-                    await ctx.page.wait_for_timeout(250)
+                if attempt < 2:
+                    await ctx.page.wait_for_timeout(300)
 
         raise RuntimeError(
             f"Snapshot generation failed for content hash {content_hash[:8]}"
@@ -562,7 +569,7 @@ class BrowserSession:
         if (
             target_page is not None
             and not target_page.is_closed()
-            and (self._in_flight <= 0 or (self._stream_cleanup_count % 5 == 0))
+            and self._in_flight <= 0
         ):
             with suppress(Exception):
                 await target_page.evaluate(DOM_GC_CLEANUP_JS)
@@ -752,7 +759,6 @@ class BrowserSession:
 
 
 __all__ = [
-    "BOTGUARD_BOOTSTRAP_PROMPT",
     "DEFAULT_BOOTSTRAP_TEMPLATE",
     "BrowserSession",
     "_is_aistudio_page_url",
