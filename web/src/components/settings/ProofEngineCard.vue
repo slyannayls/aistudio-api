@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { systemApi } from '@/api/system.ts'
+import { accountsApi } from '@/api/accounts.ts'
 import { useToastStore } from '@/stores/toast.ts'
 import type { ProofEngineConfig } from '@/types/system.ts'
 import Button from '@/components/ui/Button.vue'
@@ -13,6 +14,7 @@ import {
   Sparkles,
   ArrowRightLeft,
   CheckCircle2,
+  RefreshCw,
 } from 'lucide-vue-next'
 
 const props = defineProps<{
@@ -30,6 +32,20 @@ const remoteUrl = ref(props.initialEngine?.remote_url || 'https://waa.spinsnow.f
 const autoFallback = ref(props.initialEngine?.auto_fallback !== false)
 const timeoutSeconds = ref(props.initialEngine?.timeout_seconds || 15)
 const saving = ref(false)
+const rotating = ref(false)
+
+async function handleManualRotate() {
+  rotating.value = true
+  try {
+    const res = await accountsApi.rotateCookies()
+    toast.success(res.message || 'Cookie 轮转刷新成功，已自动同步到同组所有账号')
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Cookie 轮转刷新失败'
+    toast.error(msg)
+  } finally {
+    rotating.value = false
+  }
+}
 
 watch(
   () => props.initialEngine,
@@ -240,6 +256,30 @@ async function handleSave() {
             class="w-full text-xs font-mono px-3 py-2 bg-white border border-gray-300 rounded-lg shadow-2xs outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
           >
         </div>
+      </div>
+
+      <!-- Dual-layer Cookie Keep-Alive Section -->
+      <div class="pt-3 border-t border-gray-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div class="space-y-0.5">
+          <div class="text-xs font-bold text-gray-900 flex items-center gap-1.5">
+            <RefreshCw class="w-3.5 h-3.5 text-blue-600" />
+            <span>纯 HTTP RotateCookies 双层凭据轮转</span>
+            <span class="text-[10px] bg-blue-50 text-blue-700 px-1.5 py-0.2 rounded font-semibold border border-blue-200/60">后台自动启用</span>
+          </div>
+          <p class="text-[11px] text-gray-500">
+            优先通过 Google 原生 HTTP 接口（~100ms）轮转 <code>__Secure-1PSIDTS</code> 短效凭据，失败时自动降级唤醒本地浏览器保活，零页面开销。
+          </p>
+        </div>
+        <Button
+          variant="secondary"
+          size="sm"
+          :loading="rotating"
+          class="shrink-0 text-xs self-start sm:self-auto"
+          @click="handleManualRotate"
+        >
+          <RefreshCw class="w-3.5 h-3.5 mr-1 text-blue-600" />
+          立即轮转刷新
+        </Button>
       </div>
     </div>
   </div>

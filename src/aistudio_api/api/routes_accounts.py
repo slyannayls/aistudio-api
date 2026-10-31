@@ -885,3 +885,20 @@ async def import_bundle(
         imported_count=len(imported_accounts),
         accounts=imported_accounts,
     )
+
+
+@router.post("/rotate-cookies")
+async def rotate_active_cookies(
+    runtime_state: RuntimeState = Depends(get_runtime_state),
+) -> dict[str, object]:
+    """手动触发当前活跃账号的 HTTP RotateCookies 轮转刷新。"""
+    client = runtime_state.client
+    if not client or not client._session:
+        raise HTTPException(503, detail="服务未就绪")
+    try:
+        ok = await client._session.rotate_cookies_now()
+        if not ok:
+            raise HTTPException(500, detail="RotateCookies 轮转刷新失败，请检查账号状态")
+        return {"ok": True, "message": "Cookie 轮转刷新成功，已自动同步到同组所有账号"}
+    except Exception as e:
+        raise HTTPException(500, detail=f"轮转刷新失败: {e}") from e

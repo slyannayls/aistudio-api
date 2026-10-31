@@ -625,14 +625,23 @@ class BrowserSession:
             target and await load_cookies_to_page(target, self._auth_file, force_inject=True)
         )
 
+    async def rotate_cookies_now(self) -> bool:
+        """Manually trigger immediate cookie rotation for the active account."""
+        if not self._auth_file:
+            raise RuntimeError("当前活跃会话无有效 auth_file 凭据文件")
+        from aistudio_api.infrastructure.gateway.cookie_rotate import (
+            rotate_account_cookies,
+        )
+        ok = await rotate_account_cookies(self._auth_file, page=self.page)
+        if ok:
+            self._last_activity = time.time()
+        return ok
+
     async def keepalive_tick(self) -> bool:
         """Perform a periodic lightweight keep-alive if the session has been idle."""
         if self._in_flight > 0:
             return False
         if not self._gate.is_ready():
-            return False
-        page = self.page
-        if page is None or page.is_closed():
             return False
 
         now = time.time()
@@ -640,21 +649,42 @@ class BrowserSession:
         if now - self._last_activity < 900:
             return False
 
+        auth_user = self.get_current_auth_user()
+        log.info(
+            "[keepalive] 会话已空闲 %.1f 分钟，启动双层保活流程 (u/%s)...",
+            (now - self._last_activity) / 60,
+            auth_user,
+        )
+
+        # 1. 第一层：优先尝试纯 HTTP RotateCookies (极速 ~100ms、零浏览器 CPU 开销)
+        if self._auth_file:
+            try:
+                from aistudio_api.infrastructure.gateway.cookie_rotate import (
+                    rotate_account_cookies,
+                )
+                rotated = await rotate_account_cookies(self._auth_file, page=self.page)
+                if rotated:
+                    self._last_activity = time.time()
+                    log.info("[keepalive] 🚀 纯 HTTP RotateCookies 轮转成功，凭据已刷新并同步！")
+                    return True
+            except Exception as e:
+                log.warning("[keepalive] 纯 HTTP RotateCookies 轮转异常 (%s)，降级为浏览器心跳...", e)
+
+        # 2. 第二层：本地浏览器保活兜底 (如果 HTTP 轮转失败)
+        page = self.page
+        if page is None or page.is_closed():
+            return False
+
         try:
-            auth_user = self.get_current_auth_user()
-            log.info(
-                "[keepalive] 会话已空闲 %.1f 分钟，执行轻量保活心跳 (u/%s)...",
-                (now - self._last_activity) / 60,
-                auth_user,
-            )
+            log.info("[keepalive] 执行浏览器页面心跳保活 (u/%s)...", auth_user)
             await extract_account_tier(page, auth_user=auth_user)
             if self._auth_file:
                 await save_browser_cookies(page, self._auth_file)
             self._last_activity = time.time()
-            log.info("[keepalive] 保活心跳完成，已同步刷新凭据")
+            log.info("[keepalive] 浏览器保活心跳完成，凭据已同步回写")
             return True
         except Exception as e:
-            log.warning("[keepalive] 保活心跳执行失败: %s", e)
+            log.warning("[keepalive] 浏览器保活心跳执行失败: %s", e)
             return False
 
     async def _save_cookies(
