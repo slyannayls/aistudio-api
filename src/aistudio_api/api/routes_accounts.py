@@ -761,6 +761,41 @@ async def probe_and_import(
     )
 
 
+def _normalize_bundle_items(raw_data: object) -> list[dict[str, object]]:
+    """把各种形态的导入数据规整成账号条目列表。
+
+    兼容三种输入：
+    1. 列表：多账号条目
+    2. {"accounts": [...]} 或 {"profiles": [...]}
+    3. 单个 Tampermonkey 抓取对象（顶层直接含 cookies / authUser / g1Tier）
+    """
+    if isinstance(raw_data, list):
+        raw_list = raw_data
+    elif isinstance(raw_data, dict):
+        nested = raw_data.get("accounts") or raw_data.get("profiles")
+        if isinstance(nested, list):
+            raw_list = nested
+        elif raw_data.get("cookies"):
+            raw_list = [raw_data]
+        else:
+            raw_list = []
+    else:
+        raw_list = []
+
+    tier_map = {"TIER0": "Free", "TIER1": "Pro", "TIER2": "Ultra"}
+    items: list[dict[str, object]] = []
+    for item in raw_list:
+        if not isinstance(item, dict) or not item.get("cookies"):
+            continue
+        normalized = dict(item)
+        if not normalized.get("auth_user") and normalized.get("authUser") is not None:
+            normalized["auth_user"] = str(normalized["authUser"])
+        if not normalized.get("tier") and normalized.get("g1Tier"):
+            normalized["tier"] = tier_map.get(str(normalized["g1Tier"]).upper(), "")
+        items.append(normalized)
+    return items
+
+
 @router.post("/import-bundle", response_model=ImportBundleResponse)
 async def import_bundle(
     req: ImportBundleRequest,
@@ -794,15 +829,7 @@ async def import_bundle(
             raise HTTPException(
                 status_code=400, detail=f"JSON 内容解析失败: {e}"
             ) from e
-        if isinstance(raw_data, list):
-            raw_list = raw_data
-        elif isinstance(raw_data, dict):
-            raw_list = raw_data.get("accounts") or raw_data.get("profiles") or []
-        else:
-            raw_list = []
-        for item in raw_list:
-            if isinstance(item, dict) and item.get("cookies"):
-                items_to_import.append(item)
+        items_to_import.extend(_normalize_bundle_items(raw_data))
     elif req.file_path:
         fpath = Path(req.file_path).expanduser().resolve()
         if not fpath.is_file():
@@ -814,15 +841,7 @@ async def import_bundle(
             raise HTTPException(
                 status_code=400, detail=f"读取或解析文件失败: {e}"
             ) from e
-        if isinstance(raw_data, list):
-            raw_list = raw_data
-        elif isinstance(raw_data, dict):
-            raw_list = raw_data.get("accounts") or raw_data.get("profiles") or []
-        else:
-            raw_list = []
-        for item in raw_list:
-            if isinstance(item, dict) and item.get("cookies"):
-                items_to_import.append(item)
+        items_to_import.extend(_normalize_bundle_items(raw_data))
     else:
         raise HTTPException(
             status_code=400,
