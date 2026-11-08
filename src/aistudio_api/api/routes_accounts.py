@@ -885,6 +885,9 @@ async def import_bundle(
 
     had_active_account = account_service.get_active_account() is not None
     imported_accounts: list[AccountResponse] = []
+    # 同一次导入的所有条目都来自同一份浏览器 cookie，必须共用同一个 cookie_id，
+    # 否则 u/0..u/N 会被拆成多个「凭据组」，兄弟账号同步与整组删除都会失效。
+    cid = f"cookie_{secrets.token_hex(4)}"
     for idx, item in enumerate(items_to_import):
         raw_cookie_str = str(item.get("cookies") or "")
         if not raw_cookie_str:
@@ -919,7 +922,6 @@ async def import_bundle(
                             if probed and probed != "Free":
                                 acc_tier = probed
         acc_tier = acc_tier or "Free"
-        cid = f"cookie_{secrets.token_hex(4)}"
 
         account = account_service.save_account_from_cookies(
             name=acc_name,
