@@ -93,7 +93,14 @@ async def get_model(
     session = runtime_state.client.session if runtime_state.client else None
     from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
 
-    model_info = await model_discovery.get_model_by_id(model_id, session=session)
+    from aistudio_api.infrastructure.gateway.model_defaults import (
+        strip_model_thinking_suffix,
+    )
+
+    clean_model_id, _ = strip_model_thinking_suffix(model_id)
+    model_info = await model_discovery.get_model_by_id(
+        clean_model_id, session=session
+    )
     if model_info is not None:
         logger.debug("返回模型详情: model=%s", model_id)
         return _to_gemini_model(model_info)

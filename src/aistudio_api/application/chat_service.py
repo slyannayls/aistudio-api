@@ -9,7 +9,10 @@ if TYPE_CHECKING:
 
 from dataclasses import dataclass
 
-from aistudio_api.infrastructure.gateway.model_defaults import resolve_model_defaults
+from aistudio_api.infrastructure.gateway.model_defaults import (
+    resolve_model_defaults,
+    strip_model_thinking_suffix,
+)
 from aistudio_api.infrastructure.gateway.wire_codec import build_tools_from_names
 from aistudio_api.infrastructure.gateway.wire_spec import JspbArray, SchemaIndex
 from aistudio_api.infrastructure.gateway.wire_types import (
@@ -600,10 +603,13 @@ def normalize_gemini_request(
     if not req.contents:
         raise ValueError("contents is required")
 
-    model = (
+    clean_model_name, forced_thinking_level = strip_model_thinking_suffix(
         requested_model
-        if requested_model.startswith("models/")
-        else f"models/{requested_model}"
+    )
+    model = (
+        clean_model_name
+        if clean_model_name.startswith("models/")
+        else f"models/{clean_model_name}"
     )
     contents: list[AistudioContent] = []
 
@@ -889,6 +895,16 @@ def normalize_gemini_request(
             and "thinking_config" in generation_config_overrides
         ):
             generation_config_overrides["thinking_config"] = None
+
+    if forced_thinking_level is not None and (
+        generation_config_overrides is None
+        or "thinking_config" not in generation_config_overrides
+    ):
+        if generation_config_overrides is None:
+            generation_config_overrides = {}
+        generation_config_overrides["thinking_config"] = AistudioThinkingConfig(
+            level=forced_thinking_level, mode=1
+        ).to_wire()
 
     return NormalizedGeminiRequest(
         model=model,
