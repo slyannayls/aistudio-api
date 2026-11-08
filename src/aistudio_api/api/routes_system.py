@@ -444,13 +444,37 @@ async def test_signer_server(req: TestSignerServerRequest) -> dict[str, object]:
         async with httpx.AsyncClient(timeout=8.0, proxy=proxy) as client:
             resp = await client.get(f"{target_url}/health")
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-            is_ok = resp.status_code == 200
-            data = resp.json() if is_ok else {}
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                return {
+                    "ok": True,
+                    "status_code": 200,
+                    "elapsed_ms": elapsed_ms,
+                    "data": data,
+                }
+
+            # 部分远端实现没有 /health 端点（例如 spinsnow 对 GET /health 返回 400），
+            # 退回用一次空的 proof 请求判断服务是否真的在线：
+            # 200 = 正常出签名；400/422 = 参数不全但服务活着。
+            probe = await client.post(
+                f"{target_url}/v1/proof/mint",
+                json={},
+                headers={"Content-Type": "application/json"},
+            )
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            reachable = probe.status_code in (200, 400, 422)
             return {
-                "ok": is_ok,
-                "status_code": resp.status_code,
+                "ok": reachable,
+                "status_code": probe.status_code,
                 "elapsed_ms": elapsed_ms,
-                "data": data,
+                "data": (
+                    {"note": "该服务未实现 /health，已改用 proof 端点探活"}
+                    if reachable
+                    else {}
+                ),
             }
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
