@@ -853,6 +853,36 @@ async def import_bundle(
             status_code=400, detail="未解析到任何包含有效 cookies 的账号条目"
         )
 
+    # 单条目导入时尝试递归探活子账号（u/0..u/N）。
+    # 抓取脚本导出的是"一份浏览器 cookie"，同一份 cookie 可以访问该浏览器
+    # 已登录的全部 Google 身份；不探活的话用户得为每个 u/N 手动导一次。
+    if len(items_to_import) == 1:
+        seed = items_to_import[0]
+        from aistudio_api.infrastructure.account.cookie_parser import (
+            probe_google_accounts_infinite,
+        )
+
+        try:
+            probed = await probe_google_accounts_infinite(
+                str(seed.get("cookies") or "")
+            )
+        except Exception as e:
+            log.debug("导入时递归探活失败: %s", e)
+            probed = []
+        if len(probed) > 1:
+            base_name = str(seed.get("name") or "Google Account")
+            items_to_import = [
+                {
+                    "name": f"{base_name} (u/{p['auth_user']})",
+                    "email": p.get("email"),
+                    "cookies": seed.get("cookies"),
+                    "auth_user": p["auth_user"],
+                    "tier": p.get("tier") or "Free",
+                }
+                for p in probed
+            ]
+            log.info("导入时递归探活到 %d 个子账号", len(probed))
+
     had_active_account = account_service.get_active_account() is not None
     imported_accounts: list[AccountResponse] = []
     for idx, item in enumerate(items_to_import):
