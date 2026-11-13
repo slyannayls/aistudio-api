@@ -48,6 +48,12 @@ SM_ARCH="${OS_PREFIX}-${GO_ARCH}"
 DEPS_DIR="${SCRIPT_DIR}/.deps/spidermonkey/${SM_ARCH}"
 mkdir -p "$DEPS_DIR"
 
+# zig / clang 在 Windows 上是原生程序，不认 MSYS 的 /c/... 路径，
+# 统一转成 C:/... 形式再传给编译器。
+if command -v cygpath >/dev/null 2>&1; then
+  DEPS_DIR="$(cygpath -m "$DEPS_DIR")"
+fi
+
 if [ ! -f "$DEPS_DIR/lib/libjs_static.a" ]; then
   TARBALL="spidermonkey-${SM_VERSION}-${SM_ARCH}.tar.gz"
   OFFICIAL_URL="https://github.com/Mag1cFall/firefox/releases/download/${SM_VERSION}/${TARBALL}"
@@ -111,10 +117,16 @@ fi
 
 # 检查编译器
 if command -v zig >/dev/null 2>&1; then
+  # zig 不认 Go 的 amd64 写法，统一映射成 x86_64 / aarch64
+  case "${GO_ARCH}" in
+    amd64) ZIG_ARCH="x86_64" ;;
+    arm64) ZIG_ARCH="aarch64" ;;
+    *)     ZIG_ARCH="${GO_ARCH}" ;;
+  esac
   case "$TARGET_GOOS" in
-    linux)   ZIG_TARGET="${GO_ARCH}-linux-musl" ;;
-    darwin)  ZIG_TARGET="${GO_ARCH}-macos-none" ;;
-    windows) ZIG_TARGET="${GO_ARCH}-windows-gnu" ;;
+    linux)   ZIG_TARGET="${ZIG_ARCH}-linux-musl" ;;
+    darwin)  ZIG_TARGET="${ZIG_ARCH}-macos-none" ;;
+    windows) ZIG_TARGET="${ZIG_ARCH}-windows-gnu" ;;
   esac
   CC_CMD="zig cc -target ${ZIG_TARGET}"
   CXX_CMD="zig c++ -target ${ZIG_TARGET}"
