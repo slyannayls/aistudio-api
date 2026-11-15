@@ -77,7 +77,9 @@ class AccountBreakdownItem(BaseModel):
     today_tokens: int = 0
     today_reasoning_tokens: int = 0
     configured_quota: int = 100
+    configured_token_quota: int | None = None
     quota_used_percent: float = 0.0
+    token_quota_used_percent: float = 0.0
     is_available: bool = True
     cooldown_remaining: int = 0
 
@@ -133,3 +135,26 @@ class GeminiModelResponse(BaseModel):
 
 class GeminiModelListResponse(BaseModel):
     models: list[GeminiModelResponse]
+
+
+class GeminiCountTokensResponse(BaseModel):
+    totalTokens: int
+    cachedContentTokenCount: int | None = None
+    promptTokensDetails: list[dict[str, object]] | None = None
+
+
+class GeminiDecisionModalityUsage(BaseModel):
+    modality: str
+    tokens: int
+
+
+class GeminiDecisionUsageResponse(BaseModel):
+    total_input_tokens: int = 0
+    input_tokens_by_modality: list[GeminiDecisionModalityUsage] = []
+    total_output_tokens: int = 0
+    total_tokens: int = 0
+
+
+class GeminiCreateDecisionResponse(BaseModel):
+    answers: dict[str, dict[str, object]]
+    usage: GeminiDecisionUsageResponse
