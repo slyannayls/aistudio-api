@@ -26,6 +26,10 @@ EXPLICIT_PROXY=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --no-proxy)
+      EXPLICIT_PROXY="none"
+      shift
+      ;;
     --test)
       RUN_TESTS=1
       shift
@@ -106,6 +110,8 @@ tcp_port_open() {
 
 detect_proxy() {
   if [ -n "$EXPLICIT_PROXY" ]; then
+    # none/direct 表示明确不使用代理，直接返回空
+    [ "$EXPLICIT_PROXY" = "none" ] || [ "$EXPLICIT_PROXY" = "direct" ] && return
     printf '%s' "$EXPLICIT_PROXY"
     return
   fi
@@ -140,7 +146,8 @@ detect_proxy() {
   fi
   local p
   for p in 7890 7897 10808 10809 2080; do
-    if tcp_port_open "127.0.0.1" "$p"; then
+    # 端口开着不代表代理可用，再实际验证一次，避免挂上死代理
+    if tcp_port_open "127.0.0.1" "$p" && curl -s -f -x "http://127.0.0.1:$p" --connect-timeout 2 --max-time 3 https://dl.google.com >/dev/null 2>&1; then
       printf 'http://127.0.0.1:%s' "$p"
       return
     fi
