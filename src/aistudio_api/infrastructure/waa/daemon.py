@@ -109,8 +109,10 @@ class LocalSignerProcess:
             or os.getenv("https_proxy")
             or ""
         ).strip()
-        if proxy:
-            cmd.extend(["-proxy", proxy])
+        # 始终显式传入 -proxy：signer 默认会探测本机 7890/7897/10808/10809
+        # 端口，一旦探到死代理（如残留的本地代理进程）就会让所有签名请求失败。
+        # 显式传空串表示直连，不挂任何代理。
+        cmd.extend(["-proxy", proxy])
         timezone = os.getenv("AISTUDIO_TIMEZONE", "").strip()
         if timezone:
             cmd.extend(["-timezone", timezone])
