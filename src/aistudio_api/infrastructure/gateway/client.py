@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import aclosing
 from dataclasses import dataclass
 
 from aistudio_api.config import DEFAULT_TEXT_MODEL
@@ -97,18 +98,26 @@ class AIStudioClient:
         max_tokens: int | None = None,
         generation_config_overrides: dict | None = None,
         force_recreate_signer: bool = False,
+        ctx: SessionContext | None = None,
     ) -> PreparedRequest:
-        ctx = await self._session.ensure_ready()
+        active_ctx = (
+            ctx
+            if isinstance(ctx, SessionContext)
+            else await self._session.ensure_ready()
+        )
         effective_contents = contents or [
             AistudioContent.from_user_prompt(prompt=prompt, images=images)
         ]
         if force_recreate_signer:
             snapshot = await self._session.generate_snapshot(
-                effective_contents, ctx=ctx, model=model, force_recreate=True
+                effective_contents,
+                ctx=active_ctx,
+                model=model,
+                force_recreate=True,
             )
         else:
             snapshot = await self._session.generate_snapshot(
-                effective_contents, ctx=ctx, model=model
+                effective_contents, ctx=active_ctx, model=model
             )
         body = encode_request_body(
             model=model,
@@ -127,14 +136,14 @@ class AIStudioClient:
             generation_config_overrides=generation_config_overrides,
             snapshot=snapshot,
         )
-        headers = self._build_upstream_headers(ctx)
+        headers = self._build_upstream_headers(active_ctx)
         prepared = PreparedRequest(
             url=GENERATE_CONTENT_URL,
             headers=headers,
             body=body,
             model=model,
             snapshot=snapshot,
-            ctx=ctx,
+            ctx=active_ctx,
         )
         logger.debug(
             "请求签名完成: model=%s, proof_len=%d, body_len=%d",
@@ -176,11 +185,14 @@ class AIStudioClient:
             generation_config_overrides=generation_config_overrides,
             force_recreate_signer=force_recreate_signer,
         )
-        async for event in self._streaming_gateway.stream_chat(
-            request=effective_prep,
-            model=model,
-        ):
-            yield event
+        async with aclosing(
+            self._streaming_gateway.stream_chat(
+                request=effective_prep,
+                model=model,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def generate_content(
         self,
@@ -238,21 +250,15 @@ class AIStudioClient:
         return output
 
     def _build_upstream_headers(self, ctx: SessionContext) -> dict[str, str]:
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
         headers = dict(DEFAULT_UPSTREAM_HEADERS)
-        if active_waa.get("user_agent"):
-            merge_header_case_insensitive(
-                headers, "User-Agent", str(active_waa["user_agent"])
-            )
-        server_hdrs = active_waa.get("headers")
-        if isinstance(server_hdrs, dict):
-            for k, v in server_hdrs.items():
-                merge_header_case_insensitive(headers, str(k), str(v))
-        dyn_headers = getattr(self._session, "last_signer_headers", None)
+        dyn_headers: object = None
+        get_ctx_headers = getattr(self._session, "get_signer_headers", None)
+        if callable(get_ctx_headers):
+            cand = get_ctx_headers(ctx)
+            if isinstance(cand, dict):
+                dyn_headers = cand
+        if dyn_headers is None:
+            dyn_headers = getattr(self._session, "last_signer_headers", None)
         if isinstance(dyn_headers, dict):
             for k, v in dyn_headers.items():
                 if k.lower() not in ("cookie", "authorization"):
@@ -268,16 +274,24 @@ class AIStudioClient:
         questions: dict[str, dict[str, object]],
         temperature: float | None = None,
         force_recreate_signer: bool = False,
+        ctx: SessionContext | None = None,
     ) -> PreparedRequest:
-        ctx = await self._session.ensure_ready()
+        active_ctx = (
+            ctx
+            if isinstance(ctx, SessionContext)
+            else await self._session.ensure_ready()
+        )
         digest_contents = extract_decision_digest_contents(raw_input)
         if force_recreate_signer:
             snapshot = await self._session.generate_snapshot(
-                digest_contents, ctx=ctx, model=model, force_recreate=True
+                digest_contents,
+                ctx=active_ctx,
+                model=model,
+                force_recreate=True,
             )
         else:
             snapshot = await self._session.generate_snapshot(
-                digest_contents, ctx=ctx, model=model
+                digest_contents, ctx=active_ctx, model=model
             )
         body = encode_decision_request_body(
             model=model,
@@ -286,14 +300,14 @@ class AIStudioClient:
             temperature=temperature,
             snapshot=snapshot,
         )
-        headers = self._build_upstream_headers(ctx)
+        headers = self._build_upstream_headers(active_ctx)
         prepared = PreparedRequest(
             url=CREATE_DECISION_URL,
             headers=headers,
             body=body,
             model=model,
             snapshot=snapshot,
-            ctx=ctx,
+            ctx=active_ctx,
         )
         self.last_prepared_request = prepared
         return prepared
@@ -337,15 +351,20 @@ class AIStudioClient:
         *,
         model: str = DEFAULT_TEXT_MODEL,
         contents: list[AistudioContent],
+        ctx: SessionContext | None = None,
     ) -> dict[str, object]:
-        ctx = await self._session.ensure_ready()
+        active_ctx = (
+            ctx
+            if isinstance(ctx, SessionContext)
+            else await self._session.ensure_ready()
+        )
         body = encode_count_tokens_body(model=model, contents=contents)
-        headers = self._build_upstream_headers(ctx)
+        headers = self._build_upstream_headers(active_ctx)
         status, raw = await self._session.send_request(
             body=body,
             url=COUNT_TOKENS_URL,
             headers=headers,
-            ctx=ctx,
+            ctx=active_ctx,
         )
         raw_text = raw.decode("utf-8", errors="replace")
         if status != 200:

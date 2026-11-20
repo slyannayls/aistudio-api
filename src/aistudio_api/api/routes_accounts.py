@@ -232,10 +232,14 @@ async def detect_account_email(
                     cookie_dict, auth_user=acc.auth_user or "0"
                 )
                 http_tier = await probe_account_benefit_tier(
-                    cookie_dict, auth_user=acc.auth_user or "0"
+                    cookie_dict, auth_user=acc.auth_user or "0", default=None
                 )
                 if http_tier:
-                    detected_tier = http_tier
+                    detected_tier = (
+                        "Ultra_20X"
+                        if acc.tier == "Ultra_20X" and http_tier == "Ultra"
+                        else http_tier
+                    )
         except Exception as e:
             log.debug("探测账号 %s 邮箱/等级失败: %s", account_id, e)
     if email:
@@ -267,16 +271,21 @@ async def detect_account_tier(
         try:
             cookie_dict = load_cookies_from_auth_file(target_auth)
             if cookie_dict:
-                detected_tier = await probe_account_benefit_tier(
-                    cookie_dict, auth_user=acc.auth_user or "0"
+                probed_tier = await probe_account_benefit_tier(
+                    cookie_dict, auth_user=acc.auth_user or "0", default=None
                 )
+                if probed_tier:
+                    detected_tier = (
+                        "Ultra_20X"
+                        if acc.tier == "Ultra_20X" and probed_tier == "Ultra"
+                        else probed_tier
+                    )
         except Exception as e:
             log.debug("探测账号 %s 订阅等级失败: %s", account_id, e)
 
     if detected_tier:
         account_service.update_account_tier(account_id, detected_tier)
         log.info("更新账号订阅等级: id=%s, tier=%s", account_id, detected_tier)
-
     acc = account_service.get_account(account_id)
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
@@ -407,17 +416,17 @@ async def toggle_account(
     account_service: AccountService = Depends(get_account_service),
 ) -> AccountResponse:
     """切换单个账号的使能状态 (Enabled/Disabled)。"""
+    active_before = account_service.get_active_account()
+    was_active = active_before is not None and active_before.id == account_id
     account = account_service.toggle_account_enabled(account_id, req.enabled)
     if account is None:
         raise HTTPException(status_code=404, detail="账号不存在")
 
     # 如果刚好关闭了当前活跃账号，顺延切到下一个可用账号
-    active_acc = account_service.get_active_account()
-    if active_acc and active_acc.id == account_id and not account.enabled:
+    if was_active and not account.enabled:
         from aistudio_api.application.account_orchestrator import try_switch_account
 
         await try_switch_account(failed_account_id=account_id)
-
     log.info("账号状态已切换: id=%s, enabled=%s", account.id, account.enabled)
     return to_account_response(account)
 
@@ -464,12 +473,12 @@ async def batch_toggle_group(
     account_service: AccountService = Depends(get_account_service),
 ) -> dict[str, object]:
     """按分组批量启用或停用账号。"""
+    active_before = account_service.get_active_account()
     updated = account_service.batch_toggle_group(group_name, enabled)
-    active_acc = account_service.get_active_account()
-    if active_acc and active_acc.group == group_name and not enabled:
+    if active_before and active_before.group == group_name and not enabled:
         from aistudio_api.application.account_orchestrator import try_switch_account
 
-        await try_switch_account(failed_account_id=active_acc.id)
+        await try_switch_account(failed_account_id=active_before.id)
     return {"ok": True, "count": len(updated), "group": group_name, "enabled": enabled}
 
 

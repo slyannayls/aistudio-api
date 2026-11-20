@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import itertools
 import time
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import dataclass, field
 
 from aistudio_api.config import settings
@@ -63,17 +63,9 @@ class GatewaySession:
         self._tier: str | None = None
         self._active_context: SessionContext | None = None
         self._signing_locks: dict[str, asyncio.Lock] = {}
+        self._context_signer_headers: dict[str, dict[str, str]] = {}
         self._transport = HTTPStreamTransport(proxy_url=settings.proxy_url)
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
-        server_url = str(active_waa.get("url") or settings.proof_server_url)
-        self._signer = WaaSigner(
-            proof_server_url=server_url,
-            proxy_url=settings.proxy_url,
-        )
+        self._signer = WaaSigner()
 
     @property
     def is_ready(self) -> bool:
@@ -89,10 +81,27 @@ class GatewaySession:
             get_cookie_id_from_meta(context.auth_file) == context.cookie_id
         )
 
+    @staticmethod
+    def _context_header_key(ctx: SessionContext) -> str:
+        return ctx.auth_file or f"auth-user:{ctx.auth_user}"
+
     @property
     def last_signer_headers(self) -> dict[str, str]:
         """Get dynamic protocol headers returned by the underlying signer."""
         return self._signer.last_headers
+
+    def get_signer_headers(self, ctx: SessionContext | None = None) -> dict[str, str]:
+        """Get dynamic protocol headers isolated to the given account context."""
+        if ctx is not None:
+            key = self._context_header_key(ctx)
+            if key in self._context_signer_headers:
+                return dict(self._context_signer_headers[key])
+            if not self._context_signer_headers:
+                raw = getattr(self._signer, "last_headers", None)
+                return dict(raw) if isinstance(raw, dict) else {}
+            return {}
+        raw = getattr(self._signer, "last_headers", None)
+        return dict(raw) if isinstance(raw, dict) else {}
 
     def set_ready_context(self, context: SessionContext) -> None:
         """Set active ready context (used by transitions and test fixtures)."""
@@ -197,21 +206,6 @@ class GatewaySession:
         force_recreate: bool = False,
     ) -> str:
         """仅供已持有账号签名锁的当前代际调用。"""
-        from aistudio_api.infrastructure.gateway.model_defaults import (
-            get_active_waa_server,
-        )
-
-        active_waa = get_active_waa_server()
-        target_url = str(active_waa.get("url") or "").rstrip("/")
-        remote = getattr(self._signer, "_remote_signer", None)
-        if remote and target_url and getattr(remote, "server_url", None) != target_url:
-            close_fn = getattr(self._signer, "close", None)
-            if callable(close_fn):
-                res = close_fn()
-                if inspect.isawaitable(res):
-                    await res
-            remote.server_url = target_url
-
         if not self.is_context_current(active_ctx):
             raise StaleSessionError("签名前凭据代际已更新")
         if active_ctx.auth_file:
@@ -239,20 +233,44 @@ class GatewaySession:
                 tier=tier,
                 model=model,
             )
-        self._sync_signer_cookies(active_ctx)
+        dyn_headers = getattr(self._signer, "last_headers", None)
+        pool_state = getattr(self._signer, "last_pool_state", None)
+        if isinstance(dyn_headers, dict) and dyn_headers:
+            self._context_signer_headers[self._context_header_key(active_ctx)] = {
+                str(k): str(v) for k, v in dyn_headers.items()
+            }
+        self._sync_signer_cookies(
+            active_ctx,
+            dyn_headers=dyn_headers if isinstance(dyn_headers, dict) else None,
+            pool_state=str(pool_state) if pool_state is not None else None,
+        )
         return proof
 
-    def _sync_signer_cookies(self, active_ctx: SessionContext) -> None:
+    def _sync_signer_cookies(
+        self,
+        active_ctx: SessionContext,
+        *,
+        dyn_headers: dict[str, str] | None = None,
+        pool_state: str | None = None,
+    ) -> None:
         """仅当 WAA 签名服务冷启动 (cold) 访问官网产生新 SIDCC 时同步回本地；严禁热复用 (hot) 用旧 PSIDTS 反向覆盖。"""
         if not self.is_context_current(active_ctx):
             return
-        pool_state = getattr(self._signer, "last_pool_state", None)
-        if pool_state == "hot":
+        effective_pool = (
+            pool_state
+            if pool_state is not None
+            else getattr(self._signer, "last_pool_state", None)
+        )
+        if effective_pool == "hot":
             return
-        dyn_headers = getattr(self._signer, "last_headers", None)
-        if not isinstance(dyn_headers, dict):
+        effective_headers = (
+            dyn_headers
+            if dyn_headers is not None
+            else getattr(self._signer, "last_headers", None)
+        )
+        if not isinstance(effective_headers, dict):
             return
-        raw_cookie = dyn_headers.get("Cookie") or dyn_headers.get("cookie")
+        raw_cookie = effective_headers.get("Cookie") or effective_headers.get("cookie")
         if not raw_cookie or not isinstance(raw_cookie, str):
             return
         parsed = parse_raw_cookies(raw_cookie)
@@ -260,7 +278,7 @@ class GatewaySession:
             return
         sync_names = (
             ("SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC")
-            if pool_state == "cold"
+            if effective_pool == "cold"
             else ROTATING_SESSION_COOKIE_NAMES
         )
         changed = False
@@ -291,13 +309,14 @@ class GatewaySession:
         force_recreate: bool = False,
     ) -> tuple[str, dict[str, str]]:
         """Generate fresh WAA proof token and dynamic session headers."""
+        active_ctx = ctx or await self.ensure_ready()
         proof = await self.generate_snapshot(
             contents=contents,
-            ctx=ctx,
+            ctx=active_ctx,
             model=model,
             force_recreate=force_recreate,
         )
-        return proof, dict(self.last_signer_headers)
+        return proof, self.get_signer_headers(active_ctx)
 
     @staticmethod
     def build_request_headers(
@@ -353,17 +372,20 @@ class GatewaySession:
         req_headers = self.build_request_headers(
             headers, auth_user=active_ctx.auth_user
         )
-        async for event in self._transport.send_streaming_request(
-            url=target_url,
-            headers=req_headers,
-            body=body,
-            auth_user=active_ctx.auth_user,
-            tier=active_ctx.tier,
-            auth_file=active_ctx.auth_file,
-            cookies=active_ctx.cookies,
-            expected_cookie_id=active_ctx.cookie_id,
-        ):
-            yield event
+        async with aclosing(
+            self._transport.send_streaming_request(
+                url=target_url,
+                headers=req_headers,
+                body=body,
+                auth_user=active_ctx.auth_user,
+                tier=active_ctx.tier,
+                auth_file=active_ctx.auth_file,
+                cookies=active_ctx.cookies,
+                expected_cookie_id=active_ctx.cookie_id,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     async def close(self) -> None:
         """Close transport, signer, and reset active context."""

@@ -52,8 +52,11 @@ def _make_part(
 
 
 @pytest.mark.asyncio
-async def test_streaming_trailing_standalone_thought_signature_not_dropped():
+async def test_streaming_trailing_standalone_thought_signature_not_dropped(monkeypatch):
     """Issue #15: standalone thoughtSignature chunk right before done must be emitted."""
+    # 此处验证签名尾包，账号就绪边界使用离线桩以进入真实 SSE 处理逻辑。
+    monkeypatch.setattr(gemini, "ensure_active_account", AsyncMock())
+    monkeypatch.setattr(gemini.runtime_state, "account_service", None)
     mock_client = MagicMock(spec=AIStudioClient)
     mock_client.prepare_request = AsyncMock(
         return_value=PreparedRequest(
@@ -222,6 +225,14 @@ def test_urlsafe_base64_tool_role_and_argon_slot45_cleanup():
     gc = wire[3]
     assert len(gc) <= GenerationConfigIndex.ARGON_CAPABILITY_FLAG
 
+    from hashlib import sha256
+
+    from aistudio_api.infrastructure.waa.signer import extract_content_digest
+
+    prompt, digest = extract_content_digest(normalized.contents)
+    assert prompt == std_b64
+    assert digest == sha256(std_b64.encode("utf-8")).hexdigest()
+
 
 def test_prompt_feedback_and_trailing_zero_or_22_finish_reason():
     """PromptFeedback chunk[1] blockReason and trailing 0/22 chunks must not become FINISH_REASON_UNSPECIFIED."""
@@ -362,29 +373,14 @@ def test_transport_timeout_and_h2_available_for_slow_models():
     assert transport.timeout == 900.0
 
 
-def test_daemon_health_check_bypasses_system_proxy():
-    """Issue #16: is_service_healthy builds an opener with empty ProxyHandler."""
-    captured = {}
+@pytest.mark.asyncio
+async def test_local_signer_missing_binary_raises_clear_error(tmp_path):
+    """LocalSignerProcess raises actionable TransportError when waa-signer binary is absent."""
+    from aistudio_api.domain.errors import TransportError
 
-    class DummyResp:
-        status = 200
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-    class DummyOpener:
-        def open(self, req, timeout=0.5):
-            captured["url"] = req.full_url
-            captured["timeout"] = timeout
-            return DummyResp()
-
-    with patch("urllib.request.build_opener", return_value=DummyOpener()) as mock_build:
-        assert waa_daemon.is_service_healthy("http://127.0.0.1:8081") is True
-        mock_build.assert_called_once()
-        assert captured["url"] == "http://127.0.0.1:8081/health"
+    proc = waa_daemon.LocalSignerProcess(binary_path=tmp_path / "missing-waa-signer")
+    with pytest.raises(TransportError, match="waa-signer"):
+        await proc.ensure_started()
 
 
 @pytest.mark.asyncio
