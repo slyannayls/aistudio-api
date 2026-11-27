@@ -199,15 +199,32 @@ def discover_proxy_url() -> str | None:
 
     # 尝试自动探测本地代理（Clash / Clash Verge / v2rayN / sing-box 等常用端口）
     import socket
+    import urllib.request
 
     for port in (7890, 7897, 10808, 10809, 2080):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(0.05)
-                if s.connect_ex(("127.0.0.1", port)) == 0:
-                    return f"http://127.0.0.1:{port}"
+                if s.connect_ex(("127.0.0.1", port)) != 0:
+                    continue
         except Exception:
-            pass
+            continue
+        # 端口开着不代表代理可用：残留的死代理进程会接受 TCP 连接
+        # 但随即重置，挂上它会让所有上游请求失败。实际走一次代理验证。
+        candidate = f"http://127.0.0.1:{port}"
+        try:
+            handler = urllib.request.ProxyHandler(
+                {"http": candidate, "https": candidate}
+            )
+            opener = urllib.request.build_opener(handler)
+            req = urllib.request.Request(
+                "https://www.google.com/generate_204", method="HEAD"
+            )
+            with opener.open(req, timeout=2.5) as resp:
+                if resp.status in (204, 200):
+                    return candidate
+        except Exception:
+            continue
     return None
 
 
