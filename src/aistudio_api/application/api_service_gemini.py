@@ -36,6 +36,7 @@ from aistudio_api.api.state import runtime_state
 from aistudio_api.application.account_orchestrator import (
     MAX_RETRIES,
     ensure_active_account,
+    get_max_retries,
     record_rotator_event,
     try_switch_account,
 )
@@ -57,15 +58,33 @@ from aistudio_api.domain.errors import (
     is_transport_error,
     parse_upstream_grpc_error,
 )
+from aistudio_api.domain.models import (
+    CandidatePart,
+    GeneratedImage,
+    ThoughtSignatureEvent,
+)
 from aistudio_api.infrastructure.account.account_store import AccountMeta
 from aistudio_api.infrastructure.gateway.client import (
     AIStudioClient,
     PreparedRequest,
 )
+from aistudio_api.infrastructure.gateway.model_defaults import is_gemini4_model
 from aistudio_api.infrastructure.gateway.session import SessionContext
-from aistudio_api.infrastructure.utils.logger import get_logger
+from aistudio_api.infrastructure.gateway.wire_parser import (
+    is_terminal_wire_finish_reason,
+)
+from aistudio_api.infrastructure.utils.logger import (
+    get_logger,
+    set_current_request_account,
+)
 
 logger = get_logger("api.gemini")
+
+
+def _effective_max_retries() -> int:
+    if MAX_RETRIES != 5:
+        return max(1, int(MAX_RETRIES))
+    return get_max_retries()
 
 
 def _request_context_snapshot(client: AIStudioClient) -> SessionContext:
@@ -86,9 +105,18 @@ def _request_account(
         if not request_ctx.auth_file:
             return None, None
         account_id = Path(request_ctx.auth_file).parent.name
-        return account_svc.get_account(account_id), account_id
+        acc = account_svc.get_account(account_id)
+        set_current_request_account(
+            account_id,
+            getattr(acc, "auth_user", None) if acc else request_ctx.auth_user,
+        )
+        return acc, account_id
     account = account_svc.get_active_account()
-    return account, account.id if account else None
+    if account is not None:
+        set_current_request_account(
+            getattr(account, "id", None), getattr(account, "auth_user", "0")
+        )
+    return account, getattr(account, "id", None) if account else None
 
 
 def _is_request_generation_current(request_ctx: SessionContext | None) -> bool:
@@ -304,7 +332,7 @@ class Auth403RetryManager:
                     try:
                         session = getattr(client, "session", None)
                         result = await account_svc.rotate_account_cookies(
-                            active_acc.id, session
+                            active_acc.id, session, respect_backoff=True
                         )
                         if result.get(
                             "stale"
@@ -555,7 +583,7 @@ async def handle_attempt_exception(
                             else None
                         )
                         rot_res = await account_svc.rotate_account_cookies(
-                            active_acc.id, session
+                            active_acc.id, session, respect_backoff=True
                         )
                         if rot_res.get(
                             "stale"
@@ -585,7 +613,8 @@ async def handle_attempt_exception(
             is_session_expired=True,
             expected_cookie_id=request_ctx.cookie_id if request_ctx else None,
         ):
-            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+            max_retries = _effective_max_retries()
+            logger.info("已切换账号重试 (%d/%d)", attempt + 1, max_retries)
             return True
         raise HTTPException(
             401,
@@ -631,7 +660,8 @@ async def handle_attempt_exception(
             failed_account_id=failed_id,
             expected_cookie_id=request_ctx.cookie_id if request_ctx else None,
         ):
-            logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+            max_retries = _effective_max_retries()
+            logger.info("已切换账号重试 (%d/%d)", attempt + 1, max_retries)
             return True
         raise HTTPException(
             403, detail={"message": str(exc), "type": "auth_error"}
@@ -662,7 +692,7 @@ async def handle_attempt_exception(
             logger.warning(
                 "触发 429 限流，切换账号重试 (%d/%d): model=%s",
                 attempt + 1,
-                MAX_RETRIES,
+                _effective_max_retries(),
                 target_model,
             )
             return True
@@ -708,31 +738,32 @@ async def handle_attempt_exception(
 
     # 针对 Google 上游偶发且完全随机的 RPC 路由 404 (Ambiguous request for service '' and method '/GenerativeService.*')：
     # 此报错为上游端点偶发抖动，在未产生输出时当场立即重试（严禁切号以防浪费配额，其他 404 严格按原样报错抛出）
+    max_retries = _effective_max_retries()
     if (
         is_transient_rpc_error(exc)
         and not has_yielded_data
-        and attempt < MAX_RETRIES - 1
+        and attempt < max_retries - 1
     ):
         logger.warning(
             "上游 404 路由抖动，立即重试 (%d/%d): %s",
             attempt + 1,
-            MAX_RETRIES,
+            max_retries,
             clean_upstream_error_message(str(exc)),
         )
         return True
     if is_transport_error(exc):
         # 传输失败只能使用普通预算，最后一次失败或已发出内容时不再切号。
-        if not has_yielded_data and attempt < MAX_RETRIES - 1:
+        if not has_yielded_data and attempt < max_retries - 1:
             logger.warning(
                 "传输或签名异常，切换账号重试 (%d/%d): %s",
                 attempt + 1,
-                MAX_RETRIES,
+                max_retries,
                 exc,
             )
             if await try_switch_account(
                 model=target_model, failed_account_id=failed_id
             ):
-                logger.info("已切换账号重试 (%d/%d)", attempt + 1, MAX_RETRIES)
+                logger.info("已切换账号重试 (%d/%d)", attempt + 1, max_retries)
                 return True
         runtime_state.record(target_model, "errors")
         _record_request_rotator_event(
@@ -785,22 +816,25 @@ async def _do_generate_content(
 ) -> GeminiGenerateContentResponse:
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
-    total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    max_retries = _effective_max_retries()
+    total_attempts = max_retries + AUTH_403_MAX_RETRIES
     ordinary_attempt = 0
 
     for attempt in range(total_attempts):
-        if ordinary_attempt >= MAX_RETRIES:
+        if ordinary_attempt >= max_retries:
             break
-        ensured_ctx = await ensure_active_account(attempt, model=model_path)
-        effective_ctx = auth_manager.pinned_ctx or (
-            ensured_ctx
-            if isinstance(ensured_ctx, SessionContext)
-            else _request_context_snapshot(client)
-        )
         normalized = None
-        request_ctx: SessionContext = effective_ctx
+        request_ctx: SessionContext | None = None
         try:
             normalized = normalize_gemini_request(req, model_path)
+            ensured_ctx = await ensure_active_account(attempt, model=model_path)
+            effective_ctx = auth_manager.pinned_ctx or (
+                ensured_ctx
+                if isinstance(ensured_ctx, SessionContext)
+                else _request_context_snapshot(client)
+            )
+            request_ctx = effective_ctx
+            _request_account(request_ctx)
             logger.info(
                 "非流式请求: model=%s, 轮数=%d, 尝试=%d/%d",
                 normalized.model,
@@ -824,9 +858,14 @@ async def _do_generate_content(
             )
             auth_manager.current_prepared = None
 
-            final_fr = to_gemini_finish_reason(
-                output.candidates[0].finish_reason if output.candidates else None
-            )
+            raw_fr = output.candidates[0].finish_reason if output.candidates else None
+            if is_gemini4_model(
+                normalized.model
+            ) and not is_terminal_wire_finish_reason(raw_fr):
+                raise TransportError(
+                    f"Gemini 4 non-streaming response ended without a terminal finish_reason (got {raw_fr!r})"
+                )
+            final_fr = to_gemini_finish_reason(raw_fr)
             _record_request_rotator_event(
                 "success",
                 model=normalized.model,
@@ -853,21 +892,7 @@ async def _do_generate_content(
                 candidates=[
                     GeminiCandidateResponse(
                         content=GeminiContentResponse(
-                            parts=to_gemini_parts(
-                                output.text,
-                                function_calls=output.function_calls,
-                                function_responses=output.function_responses,
-                                thinking=output.thinking,
-                                images=output.images,
-                                reasoning_images=output.reasoning_images,
-                                thinking_signature=cand.thinking_signature
-                                if cand
-                                else "",
-                                text_signature=cand.text_signature if cand else "",
-                                standalone_signature=(
-                                    cand.standalone_signature if cand else ""
-                                ),
-                            ),
+                            parts=to_gemini_parts(cand.parts if cand else []),
                         ),
                         finishReason=final_fr,
                         index=0,
@@ -1024,44 +1049,70 @@ def format_sse_event(
     if not text:
         return None
 
-    parts: list[dict[str, object]] = []
+    candidate_parts: list[CandidatePart] = []
     if event_type == "body":
-        p: dict[str, object] = {"text": str(text)}
-        if thought_signature:
-            p["thoughtSignature"] = thought_signature
-        parts.append(p)
+        candidate_parts.append(
+            CandidatePart(
+                kind="text",
+                text=str(text),
+                has_text=True,
+                thought_signature=thought_signature or "",
+            )
+        )
     elif event_type == "thinking":
-        p = {"text": str(text), "thought": True}
-        if thought_signature:
-            p["thoughtSignature"] = thought_signature
-        parts.append(p)
+        candidate_parts.append(
+            CandidatePart(
+                kind="thinking",
+                text=str(text),
+                has_text=True,
+                thought=True,
+                thought_signature=thought_signature or "",
+            )
+        )
     elif event_type == "tool_calls":
         fc_list = text if isinstance(text, list) else []
-        parts = [
-            part.model_dump(mode="json", exclude_none=True)
-            for part in to_gemini_parts("", function_calls=fc_list)
-        ]
+        for fc in fc_list:
+            if isinstance(fc, dict):
+                candidate_parts.append(CandidatePart(kind="function_call", payload=fc))
     elif event_type == "images":
         img_list = text if isinstance(text, list) else []
-        parts = [
-            part.model_dump(mode="json", exclude_none=True)
-            for part in to_gemini_parts("", images=img_list)
-        ]
+        for img in img_list:
+            if isinstance(img, GeneratedImage):
+                candidate_parts.append(CandidatePart(kind="image", image=img))
     elif event_type == "reasoning_images":
         r_img_list = text if isinstance(text, list) else []
-        parts = [
-            part.model_dump(mode="json", exclude_none=True)
-            for part in to_gemini_parts("", reasoning_images=r_img_list)
-        ]
+        for img in r_img_list:
+            if isinstance(img, GeneratedImage):
+                candidate_parts.append(
+                    CandidatePart(kind="reasoning_image", thought=True, image=img)
+                )
+    elif event_type == "candidate_part" and isinstance(text, CandidatePart):
+        candidate_parts.append(text)
     elif event_type == "thought_signature":
-        parts = [{"thoughtSignature": str(text)}]
+        sig_thought = bool(getattr(text, "thought", False))
+        sig_empty_text = bool(getattr(text, "empty_text_carrier", False))
+        candidate_parts.append(
+            CandidatePart(
+                kind="standalone_signature",
+                has_text=sig_empty_text,
+                thought=sig_thought,
+                thought_signature=str(text),
+            )
+        )
     else:
         return None
 
-    if (
-        thought_signature
-        and parts
-        and event_type in ("tool_calls", "images", "reasoning_images")
+    parts = [
+        part.model_dump(mode="json", exclude_none=True)
+        for part in to_gemini_parts(candidate_parts, allow_empty_fallback=False)
+    ]
+    if not parts:
+        return None
+    if thought_signature and event_type in (
+        "tool_calls",
+        "images",
+        "reasoning_images",
+        "candidate_part",
     ):
         existing_signature = parts[0].get("thoughtSignature")
         if not existing_signature:
@@ -1131,6 +1182,47 @@ def format_sse_error(exc: Exception) -> str:
     )
 
 
+SSE_KEEPALIVE_INTERVAL = 15.0
+
+
+async def _iter_events_with_keepalive(
+    events: AsyncGenerator[tuple[str, object | None], None],
+    *,
+    interval: float = SSE_KEEPALIVE_INTERVAL,
+) -> AsyncGenerator[tuple[str, object | None], None]:
+    """Yield upstream events while emitting keepalive ticks on long silent pauses.
+
+    Prevents downstream clients and reverse proxies from timing out during deep
+    thinking or large buffered tool calls without cancelling the upstream reader.
+    """
+    it = events.__aiter__()
+
+    async def _next_event() -> tuple[str, object | None]:
+        return await it.__anext__()
+
+    next_task: asyncio.Task[tuple[str, object | None]] | None = None
+    try:
+        while True:
+            if next_task is None:
+                next_task = asyncio.create_task(_next_event())
+            try:
+                item = await asyncio.wait_for(
+                    asyncio.shield(next_task), timeout=interval
+                )
+                next_task = None
+                yield item
+            except TimeoutError:
+                yield ("_keepalive", None)
+            except StopAsyncIteration:
+                next_task = None
+                break
+    finally:
+        if next_task is not None:
+            if not next_task.done():
+                next_task.cancel()
+            await asyncio.gather(next_task, return_exceptions=True)
+
+
 def _build_gemini_streaming_response(
     *,
     client: AIStudioClient,
@@ -1150,14 +1242,16 @@ def _build_gemini_streaming_response(
             final_usage: dict[str, object] | None = None
             final_finish_reason: str = "STOP"
             latest_response_id: str | None = None
-            buffered_thought_sig: str | None = None
+            buffered_thought_sig: ThoughtSignatureEvent | str | None = None
+            saw_terminal_finish_reason = False
             stream_completed = False
             last_stream_error: Exception | None = None
             auth_manager = Auth403RetryManager()
-            total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+            max_retries = _effective_max_retries()
+            total_attempts = max_retries + AUTH_403_MAX_RETRIES
             ordinary_attempt = 0
             for stream_attempt in range(total_attempts):
-                if ordinary_attempt >= MAX_RETRIES:
+                if ordinary_attempt >= max_retries:
                     break
                 has_yielded_data = False
                 last_stream_error = None
@@ -1165,17 +1259,19 @@ def _build_gemini_streaming_response(
                 final_finish_reason = "STOP"
                 latest_response_id = None
                 buffered_thought_sig = None
-                ensured_ctx = await ensure_active_account(
-                    stream_attempt, model=model_path
-                )
-                effective_ctx = auth_manager.pinned_ctx or (
-                    ensured_ctx
-                    if isinstance(ensured_ctx, SessionContext)
-                    else _request_context_snapshot(client)
-                )
-                normalized = normalize_gemini_request(req, model_path)
-                request_ctx = effective_ctx
+                saw_terminal_finish_reason = False
                 try:
+                    normalized = normalize_gemini_request(req, model_path)
+                    ensured_ctx = await ensure_active_account(
+                        stream_attempt, model=model_path
+                    )
+                    effective_ctx = auth_manager.pinned_ctx or (
+                        ensured_ctx
+                        if isinstance(ensured_ctx, SessionContext)
+                        else _request_context_snapshot(client)
+                    )
+                    request_ctx = effective_ctx
+                    _request_account(request_ctx)
                     force_recreate = auth_manager.force_recreate_signer
                     auth_manager.force_recreate_signer = False
                     prepared = await _prepare_content_request(
@@ -1192,11 +1288,17 @@ def _build_gemini_streaming_response(
                             model=normalized.model, prepared=prepared
                         )
                     ) as events:
-                        async for event_type, text in events:
+                        async for event_type, text in _iter_events_with_keepalive(
+                            events
+                        ):
+                            if event_type == "_keepalive":
+                                yield ": keepalive\n\n"
+                                continue
                             if event_type == "usage":
                                 final_usage = text if isinstance(text, dict) else None
                             elif event_type == "finish_reason":
-                                if text not in (None, 0, 22):
+                                if is_terminal_wire_finish_reason(text):
+                                    saw_terminal_finish_reason = True
                                     final_finish_reason = (
                                         to_gemini_finish_reason(text)
                                         if isinstance(text, int)
@@ -1216,16 +1318,56 @@ def _build_gemini_streaming_response(
                                     if chunk:
                                         has_yielded_data = True
                                         yield chunk
-                                buffered_thought_sig = str(text)
+                                buffered_thought_sig = (
+                                    text
+                                    if isinstance(text, ThoughtSignatureEvent)
+                                    else str(text)
+                                )
                             elif event_type == "done":
                                 continue
                             else:
+                                attach_sig: str | None = (
+                                    str(buffered_thought_sig)
+                                    if buffered_thought_sig
+                                    else None
+                                )
+                                if (
+                                    isinstance(
+                                        buffered_thought_sig, ThoughtSignatureEvent
+                                    )
+                                    and buffered_thought_sig.standalone
+                                ):
+                                    is_thinking_target = event_type in (
+                                        "thinking",
+                                        "reasoning_images",
+                                    )
+                                    incompatible_affinity = (
+                                        buffered_thought_sig.thought
+                                        != is_thinking_target
+                                        or (
+                                            buffered_thought_sig.empty_text_carrier
+                                            and event_type
+                                            in ("tool_calls", "candidate_part")
+                                        )
+                                    )
+                                    if incompatible_affinity:
+                                        sig_chunk = format_sse_event(
+                                            "thought_signature",
+                                            buffered_thought_sig,
+                                            model_version=normalized.model,
+                                            response_id=latest_response_id,
+                                        )
+                                        buffered_thought_sig = None
+                                        attach_sig = None
+                                        if sig_chunk:
+                                            has_yielded_data = True
+                                            yield sig_chunk
                                 chunk = format_sse_event(
                                     event_type,
                                     text,
                                     model_version=normalized.model,
                                     response_id=latest_response_id,
-                                    thought_signature=buffered_thought_sig,
+                                    thought_signature=attach_sig,
                                 )
                                 if chunk:
                                     buffered_thought_sig = None
@@ -1251,6 +1393,13 @@ def _build_gemini_streaming_response(
                         if chunk:
                             has_yielded_data = True
                             yield chunk
+                    if (
+                        is_gemini4_model(normalized.model)
+                        and not saw_terminal_finish_reason
+                    ):
+                        raise TransportError(
+                            "Gemini 4 stream ended without a terminal finish_reason (incomplete response)"
+                        )
                     auth_manager.current_prepared = None
                     stream_completed = True
                     break
@@ -1341,7 +1490,8 @@ async def handle_gemini_decisions(
 ) -> GeminiCreateDecisionResponse:
     last_error: Exception | None = None
     auth_manager = Auth403RetryManager()
-    total_attempts = MAX_RETRIES + AUTH_403_MAX_RETRIES
+    max_retries = _effective_max_retries()
+    total_attempts = max_retries + AUTH_403_MAX_RETRIES
     ordinary_attempt = 0
     raw_model = req.model or "gemini-decision-1"
     norm_model = raw_model if raw_model.startswith("models/") else f"models/{raw_model}"
@@ -1351,7 +1501,7 @@ async def handle_gemini_decisions(
     }
 
     for attempt in range(total_attempts):
-        if ordinary_attempt >= MAX_RETRIES:
+        if ordinary_attempt >= max_retries:
             break
         ensured_ctx = await ensure_active_account(attempt, model=norm_model)
         effective_ctx = auth_manager.pinned_ctx or (
@@ -1519,9 +1669,9 @@ async def handle_gemini_count_tokens(
 
     normalized = normalize_gemini_request(effective_req, model_path)
     last_error: Exception | None = None
-    for attempt in range(MAX_RETRIES):
+    max_retries = _effective_max_retries()
+    for attempt in range(max_retries):
         ensured_ctx = await ensure_active_account(attempt, model=normalized.model)
-        # 在请求进入客户端前绑定实际账号，失败时不读取已切换的全局会话。
         request_ctx = (
             ensured_ctx
             if isinstance(ensured_ctx, SessionContext)

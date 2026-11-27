@@ -163,7 +163,23 @@ def normalize_model_name(model: str) -> str:
     return model.strip().removeprefix("models/").lower()
 
 
-_normalize_model_name = normalize_model_name
+_HYDROGEN_MODEL_RE = re.compile(
+    r"^(?:models/)?gemini-4-hydrogen(?:-google)?$", re.IGNORECASE
+)
+_NEON_MODEL_RE = re.compile(r"^(?:models/)?gemini-4-neon(?:-google)?$", re.IGNORECASE)
+_GEMINI4_MODEL_RE = re.compile(r"^(?:models/)?gemini-4(?:-|$)", re.IGNORECASE)
+
+
+def is_hydrogen_model(model: str | None) -> bool:
+    return bool(model and _HYDROGEN_MODEL_RE.match(str(model).strip()))
+
+
+def is_neon_model(model: str | None) -> bool:
+    return bool(model and _NEON_MODEL_RE.match(str(model).strip()))
+
+
+def is_gemini4_model(model: str | None) -> bool:
+    return bool(model and _GEMINI4_MODEL_RE.match(str(model).strip()))
 
 
 def _coerce_thinking_level(value: object) -> ThinkingLevel:
@@ -325,8 +341,8 @@ def _profile_from_mapping(raw: dict[str, object]) -> ModelProfile:
     contains_list = raw_contains if isinstance(raw_contains, (list, tuple)) else ()
     return ModelProfile(
         name=str(raw.get("name", "unnamed")),
-        exact=tuple(_normalize_model_name(str(v)) for v in exact_list),
-        prefixes=tuple(_normalize_model_name(str(v)) for v in prefixes_list),
+        exact=tuple(normalize_model_name(str(v)) for v in exact_list),
+        prefixes=tuple(normalize_model_name(str(v)) for v in prefixes_list),
         contains=tuple(str(v).strip().lower() for v in contains_list),
         defaults=_defaults_from_mapping(raw),
     )
@@ -404,7 +420,7 @@ def _default_config() -> dict[str, object]:
                 "required_tiers": ["Ultra", "Ultra_20X"],
             },
             "pro_required": {
-                "contains": ["argon", "image", "imagen", "gemini-3.1-pro"],
+                "contains": ["argon", "neon", "image", "imagen", "gemini-3.1-pro"],
                 "required_tiers": ["Pro", "Ultra", "Ultra_20X"],
             },
         },
@@ -444,7 +460,7 @@ def _default_config() -> dict[str, object]:
                     "daily_token_limit": 25_000_000,
                 },
                 "argon_models": {
-                    "match": {"contains": ["argon"]},
+                    "match": {"contains": ["argon", "neon"]},
                     "daily_limit": 50,
                     "daily_token_limit": 15_000_000,
                 },
@@ -470,7 +486,7 @@ def _default_config() -> dict[str, object]:
                     "daily_limit": 200,
                 },
                 "argon_models": {
-                    "match": {"contains": ["argon"]},
+                    "match": {"contains": ["argon", "neon"]},
                     "daily_limit": 200,
                 },
                 "carbon_models": {
@@ -492,7 +508,7 @@ def _default_config() -> dict[str, object]:
                     "daily_limit": 200,
                 },
                 "argon_models": {
-                    "match": {"contains": ["argon"]},
+                    "match": {"contains": ["argon", "neon"]},
                     "daily_limit": 200,
                 },
                 "carbon_models": {
@@ -554,8 +570,15 @@ def _default_config() -> dict[str, object]:
     }
 
 
-_CONFIG_CACHE: dict[str, tuple[float, dict[str, object]]] = {}
-_API_KEYS_CACHE: dict[str, tuple[float, frozenset[str], list[dict[str, str]]]] = {}
+_CONFIG_CACHE: dict[str, tuple[int, dict[str, object]]] = {}
+_API_KEYS_CACHE: dict[str, tuple[int, frozenset[str], list[dict[str, str]]]] = {}
+
+
+def _config_mtime_ns(config_path: Path) -> int:
+    try:
+        return config_path.stat().st_mtime_ns if config_path.exists() else 0
+    except OSError:
+        return 0
 
 
 def invalidate_config_cache() -> None:
@@ -571,10 +594,7 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
         return _default_config()
 
     path_key = str(config_path.resolve())
-    try:
-        mtime = config_path.stat().st_mtime
-    except OSError:
-        mtime = 0.0
+    mtime = _config_mtime_ns(config_path)
 
     cached = _CONFIG_CACHE.get(path_key)
     if cached is not None and cached[0] == mtime:
@@ -583,22 +603,37 @@ def _load_yaml_config(config_path: Path) -> dict[str, object]:
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(loaded, dict):
         loaded = {}
-    merged: dict[str, object] = _default_config()
+    def_config = _default_config()
+    merged: dict[str, object] = dict(def_config)
     merged.update(loaded)
-    raw_merged_defaults = merged.get("model_defaults")
-    raw_loaded_defaults = loaded.get("model_defaults")
-    if isinstance(raw_merged_defaults, dict) and isinstance(raw_loaded_defaults, dict):
-        def_config = _default_config()
-        def_md = def_config.get("model_defaults")
-        merged_model_defaults = dict(def_md if isinstance(def_md, dict) else {})
-        merged_model_defaults.update(raw_loaded_defaults)
-        merged["model_defaults"] = merged_model_defaults
+    for section_key in ("model_defaults", "logging"):
+        def_sec = def_config.get(section_key)
+        load_sec = loaded.get(section_key)
+        if isinstance(def_sec, dict) and isinstance(load_sec, dict):
+            sec_merged = dict(def_sec)
+            sec_merged.update(load_sec)
+            merged[section_key] = sec_merged
+    def_rot = def_config.get("rotator")
+    load_rot = loaded.get("rotator")
+    if isinstance(def_rot, dict) and isinstance(load_rot, dict):
+        rot_merged = dict(def_rot)
+        rot_merged.update(load_rot)
+        for sub_key in ("tier_weights", "cooldowns"):
+            def_sub = def_rot.get(sub_key)
+            load_sub = load_rot.get(sub_key)
+            if isinstance(def_sub, dict):
+                sub_merged = dict(def_sub)
+                if isinstance(load_sub, dict):
+                    sub_merged.update(load_sub)
+                rot_merged[sub_key] = sub_merged
+        merged["rotator"] = rot_merged
     _CONFIG_CACHE[path_key] = (mtime, merged)
     return merged
 
 
 @lru_cache(maxsize=8)
-def _compiled_profiles(config_path: str) -> tuple[ModelProfile, ...]:
+def _compiled_profiles(config_path: str, mtime_ns: int = 0) -> tuple[ModelProfile, ...]:
+    _ = mtime_ns
     config = _load_yaml_config(Path(config_path))
     raw_md = config.get("model_defaults")
     model_defaults = raw_md if isinstance(raw_md, dict) else {}
@@ -610,7 +645,10 @@ def _compiled_profiles(config_path: str) -> tuple[ModelProfile, ...]:
 
 
 @lru_cache(maxsize=8)
-def _compiled_model_overrides(config_path: str) -> dict[str, ModelDefaults]:
+def _compiled_model_overrides(
+    config_path: str, mtime_ns: int = 0
+) -> dict[str, ModelDefaults]:
+    _ = mtime_ns
     config = _load_yaml_config(Path(config_path))
     raw_md = config.get("model_defaults")
     model_defaults = raw_md if isinstance(raw_md, dict) else {}
@@ -618,7 +656,7 @@ def _compiled_model_overrides(config_path: str) -> dict[str, ModelDefaults]:
     models_dict = raw_models if isinstance(raw_models, dict) else {}
     overrides: dict[str, ModelDefaults] = {}
     for model_name, raw_defaults in models_dict.items():
-        overrides[_normalize_model_name(str(model_name))] = _defaults_from_mapping(
+        overrides[normalize_model_name(str(model_name))] = _defaults_from_mapping(
             raw_defaults if isinstance(raw_defaults, dict) else {}
         )
     return overrides
@@ -627,7 +665,7 @@ def _compiled_model_overrides(config_path: str) -> dict[str, ModelDefaults]:
 def resolve_model_defaults(
     model: str, *, config_path: str | os.PathLike[str] | None = None
 ) -> ModelDefaults:
-    normalized = _normalize_model_name(model)
+    normalized = normalize_model_name(model)
     resolved_path = str(_resolve_config_path(config_path))
     config = _load_yaml_config(Path(resolved_path))
     raw_md = config.get("model_defaults")
@@ -637,12 +675,13 @@ def resolve_model_defaults(
     elif "drop_unsupported_params" in config:
         global_drop = bool(config["drop_unsupported_params"])
 
-    profiles = _compiled_profiles(resolved_path)
+    mtime_ns = _config_mtime_ns(Path(resolved_path))
+    profiles = _compiled_profiles(resolved_path, mtime_ns)
     resolved = ModelDefaults(drop_unsupported_params=global_drop)
     for profile in profiles:
         if profile.matches(normalized):
             resolved = resolved.merged(profile.defaults)
-    override = _compiled_model_overrides(resolved_path).get(normalized)
+    override = _compiled_model_overrides(resolved_path, mtime_ns).get(normalized)
     if override is not None:
         resolved = resolved.overridden(override)
 
@@ -663,10 +702,7 @@ def get_configured_api_key_items(
     """获取 config.yaml 中配置的结构化 API Key 列表（含备注名与创建时间）。"""
     resolved_path = _resolve_config_path(config_path)
     path_key = str(resolved_path.resolve())
-    try:
-        mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
-    except OSError:
-        mtime = 0.0
+    mtime = _config_mtime_ns(resolved_path)
 
     cached = _API_KEYS_CACHE.get(path_key)
     if cached is not None and cached[0] == mtime:
@@ -705,10 +741,7 @@ def get_configured_api_keys(
     """获取 config.yaml 中配置的所有有效 API Key 集合。"""
     resolved_path = _resolve_config_path(config_path)
     path_key = str(resolved_path.resolve())
-    try:
-        mtime = resolved_path.stat().st_mtime if resolved_path.exists() else 0.0
-    except OSError:
-        mtime = 0.0
+    mtime = _config_mtime_ns(resolved_path)
 
     cached = _API_KEYS_CACHE.get(path_key)
     if cached is not None and cached[0] == mtime:
@@ -770,9 +803,11 @@ def update_configured_logging_settings(
         logging_dict["dump_dir"] = dump_dir
 
     parsed["logging"] = logging_dict
-    resolved_path.write_text(
+    from aistudio_api.infrastructure.utils.common import atomic_write_text
+
+    atomic_write_text(
+        resolved_path,
         yaml.dump(parsed, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
     )
     invalidate_config_cache()
     return logging_dict
@@ -822,7 +857,7 @@ def resolve_tier_quota_limits(
     config_path: str | os.PathLike[str] | None = None,
 ) -> TierQuotaLimits:
     """计算指定账号层级在目标模型上的每日请求次数与 Token 软额度限制。"""
-    normalized_model = _normalize_model_name(model) if model else ""
+    normalized_model = normalize_model_name(model) if model else ""
     quotas = get_configured_tier_quotas(config_path)
 
     # 1. 解析层级基础规则
@@ -871,7 +906,7 @@ def resolve_tier_quota_limits(
                         if isinstance(p, str)
                     ]
                     exact = [
-                        _normalize_model_name(str(e))
+                        normalize_model_name(str(e))
                         for e in (raw_match.get("exact") or [])
                         if isinstance(e, str)
                     ]
@@ -900,7 +935,7 @@ def resolve_tier_quota_limits(
     raw_overrides = quotas.get("overrides")
     if normalized_model and isinstance(raw_overrides, dict):
         for m_key, val in raw_overrides.items():
-            if _normalize_model_name(str(m_key)) == normalized_model:
+            if normalize_model_name(str(m_key)) == normalized_model:
                 if isinstance(val, dict):
                     ov_daily = (
                         _parse_positive_int(

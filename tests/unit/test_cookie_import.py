@@ -7,11 +7,14 @@ from aistudio_api.infrastructure.account.cookie_parser import (
 )
 
 
-def test_parse_cookie_string_skips_host_only_cookies():
-    state = parse_cookie_string("__Host-GAPS=abc; SID=sid123")
+def test_parse_cookie_string_keeps_allowed_and_skips_unknown_host_only_cookies():
+    state = parse_cookie_string("__Host-GAPS=abc; __Host-OTHER=xyz; SID=sid123")
     cookies = state.get("cookies")
     assert isinstance(cookies, list)
-    assert cookies == [{"name": "SID", "value": "sid123"}]
+    assert cookies == [
+        {"name": "__Host-GAPS", "value": "abc"},
+        {"name": "SID", "value": "sid123"},
+    ]
 
 
 def test_filter_minimal_cookies_and_makersuite_headers():
@@ -87,7 +90,7 @@ def test_parse_cookie_string_discards_transient_and_telemetry_cookies():
     raw = (
         "SID=sid_val; SAPISID=sapisid_val; __Secure-1PSID=psid_val; "
         "_ga=GA1.2.123; NID=511=nid_val; SIDCC=sidcc_val; LSID=lsid_val; "
-        "__Host-1PLSID=host_lsid; __Host-GAPS=host_gaps; "
+        "__Host-1PLSID=host_lsid; __Host-GAPS=host_gaps; __Host-EXTRA=drop_me; "
         "OSID=stale_osid; __Secure-OSID=stale_sec_osid"
     )
     state = parse_cookie_string(raw, discard_transient=True)
@@ -101,11 +104,12 @@ def test_parse_cookie_string_discards_transient_and_telemetry_cookies():
     assert "SIDCC" in names
     assert "LSID" in names
     assert "__Host-1PLSID" in names
+    assert "__Host-GAPS" in names
 
     # Stale/transient/tracking cookies must be discarded
     assert "_ga" not in names
     assert "NID" not in names
-    assert "__Host-GAPS" not in names
+    assert "__Host-EXTRA" not in names
     assert "OSID" not in names
     assert "__Secure-OSID" not in names
 
@@ -542,6 +546,7 @@ async def test_rotate_google_cookies_and_sibling_sync(tmp_path):
                 auth_user="1",
                 auth_file=str(u1_auth_path),
                 cookies=load_cookies_from_auth_file(u1_auth_path),
+                cookie_id="cid_shared",
             )
         )
 
@@ -566,3 +571,82 @@ async def test_rotate_google_cookies_and_sibling_sync(tmp_path):
         assert session.active_context.cookies["__Secure-1PSIDTS"] == "rotated_ts_999"
     finally:
         await mock_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pro_account_bundle_and_cookie_import_preserves_pro_tier(
+    tmp_path, monkeypatch
+):
+    """Verify importing a Pro account via bundle, Cookie-Editor JSON array, or g1Tier=TIER1 never downgrades to Free."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from aistudio_api.api import routes_accounts
+    from aistudio_api.api.routes_accounts import (
+        ImportBundleRequest,
+        UpdateTierRequest,
+        import_bundle,
+        update_account_tier_manual,
+    )
+    from aistudio_api.application.account_service import AccountService
+    from aistudio_api.infrastructure.account.account_store import AccountStore
+    from aistudio_api.infrastructure.account.cookie_parser import (
+        normalize_benefit_tier,
+        parse_benefit_tier_response,
+        parse_raw_cookies,
+    )
+    from aistudio_api.infrastructure.gateway.model_discovery import model_discovery
+
+    # 1. Tier normalization & extended response shapes
+    assert normalize_benefit_tier("TIER1") == "Pro"
+    assert normalize_benefit_tier("TIER2") == "Ultra"
+    assert normalize_benefit_tier("Google AI Pro") == "Pro"
+    assert parse_benefit_tier_response("[[1]]") == "Pro"
+    assert parse_benefit_tier_response("[null, 1]") == "Pro"
+    assert parse_benefit_tier_response('["TIER1"]') == "Pro"
+
+    # 2. Netscape #HttpOnly_ prefix and domain priority
+    netscape_httponly = (
+        "#HttpOnly_.google.com\tTRUE\t/\tTRUE\t0\t__Secure-1PSID\tgood_psid\n"
+        ".google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tgood_sapisid"
+    )
+    parsed_ns = parse_raw_cookies(netscape_httponly)
+    assert parsed_ns["__Secure-1PSID"] == "good_psid"
+    assert parsed_ns["SAPISID"] == "good_sapisid"
+
+    # 3. Bundle import without explicit tier probes upstream and keeps Pro
+    monkeypatch.setattr(
+        routes_accounts, "probe_account_benefit_tier", AsyncMock(return_value="Pro")
+    )
+    monkeypatch.setattr(
+        routes_accounts,
+        "probe_account_email",
+        AsyncMock(return_value="pro_user@gmail.com"),
+    )
+    store = AccountStore(accounts_dir=tmp_path / "accounts_pro_bundle")
+    svc = AccountService(store)
+
+    cookie_editor_json = json.dumps(
+        [
+            {"name": "SAPISID", "value": "sap_pro", "domain": ".google.com"},
+            {"name": "SID", "value": "sid_pro", "domain": ".google.com"},
+        ]
+    )
+    res = await import_bundle(
+        ImportBundleRequest(content=cookie_editor_json),
+        account_service=svc,
+    )
+    assert res.imported_count == 1
+    assert res.accounts[0].tier == "Pro"
+
+    # 4. Manual tier override endpoint updates tier & invalidates model cache
+    updated = await update_account_tier_manual(
+        account_id=res.accounts[0].id,
+        req=UpdateTierRequest(tier="Ultra"),
+        account_service=svc,
+    )
+    assert updated.tier == "Ultra"
+
+    # 5. Fallback models include gemini-4-hydrogen
+    fallback = await model_discovery.get_models(force_refresh=True)
+    assert any(m.get("id") == "gemini-4-hydrogen" for m in fallback)

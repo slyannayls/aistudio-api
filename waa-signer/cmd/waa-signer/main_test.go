@@ -287,6 +287,31 @@ func TestWorkerPoolForceRecreateKeepsCurrentRotation(t *testing.T) {
 	}
 }
 
+func TestWorkerPoolForceRecreateReplacesExpiredCookiesFromInput(t *testing.T) {
+	pool, factory := newOfflinePool()
+	first := acquireOffline(t, pool, offlineCookies)
+	worker := first.worker.(*fakePoolWorker)
+	first.Release()
+
+	expiredState := offlineState(t, offlineCookies)
+	for i := range expiredState.Cookies {
+		if expiredState.Cookies[i].Name == "__Secure-1PSIDTS" {
+			expiredState.Cookies[i].Value = "fixture-expired-ts"
+			expiredState.Cookies[i].Expires = float64(time.Now().Add(-time.Hour).Unix())
+		}
+	}
+	worker.setStorage(expiredState)
+
+	freshCookies := strings.Replace(offlineCookies, "fixture-old-ts", "fixture-fresh-ts", 1)
+	lease := acquireOffline(t, pool, freshCookies)
+	if err := lease.Recreate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := cookieFixtureValue(t, factory.input(1), "__Secure-1PSIDTS"); got != "fixture-fresh-ts" {
+		t.Fatalf("expected fresh input cookie after expired worker cookie eviction, got %q", got)
+	}
+}
+
 func TestWorkerPoolInitializationFailureDoesNotPublish(t *testing.T) {
 	pool, factory := newOfflinePool()
 	first := acquireOffline(t, pool, offlineCookies)
@@ -616,5 +641,37 @@ func TestServeIPCHealthMintLargePayloadAndEOFShutdown(t *testing.T) {
 	}
 	if factory.calls() != 1 || pool.ActiveCount() != 0 {
 		t.Fatalf("expected clean worker shutdown after EOF, active=%d", pool.ActiveCount())
+	}
+}
+
+func TestWorkerPoolEvictsExpiredIdleEntries(t *testing.T) {
+	pool, factory := newOfflinePool()
+
+	// Acquire first worker
+	lease1, err := pool.AcquireWorker(context.Background(), offlineCookies, 0, "gemini-3.7-flash", "")
+	if err != nil {
+		t.Fatalf("acquire worker 0 failed: %v", err)
+	}
+	key1 := lease1.key
+	// Backdate entry1 beyond maxWorkerAge
+	lease1.entry.createdAt = time.Now().Add(-maxWorkerAge - time.Minute)
+	lease1.entry.lastUsed = lease1.entry.createdAt
+	lease1.Release()
+
+	// Acquiring a different worker triggers evictExpiredEntries(key2)
+	lease2, err := pool.AcquireWorker(context.Background(), offlineCookies, 1, "gemini-3.7-flash", "")
+	if err != nil {
+		t.Fatalf("acquire worker 1 failed: %v", err)
+	}
+	lease2.Release()
+
+	pool.mu.RLock()
+	_, stillPresent := pool.entries[key1]
+	pool.mu.RUnlock()
+	if stillPresent {
+		t.Fatalf("expected expired worker entry %s to be evicted from pool.entries", key1)
+	}
+	if factory.calls() != 2 || pool.ActiveCount() != 1 {
+		t.Fatalf("expected 1 active worker after eviction, got calls=%d active=%d", factory.calls(), pool.ActiveCount())
 	}
 }
